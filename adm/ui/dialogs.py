@@ -315,12 +315,20 @@ class StatsDialog(QDialog):
         total_msg = sum(m.n_messages for m in metas)
         total_tok = sum(m.tokens or 0 for m in metas)
 
+        from .. import sources
+        others: dict[str, int] = {}
+        for m in metas:
+            if m.source not in ("claude", "codex"):
+                others[m.source] = others.get(m.source, 0) + 1
+        extra = " · ".join(f"{sources.badge(k)} {v}"
+                           for k, v in sorted(others.items(), key=lambda kv: -kv[1]))
         head = QLabel(
             tr("stats_l1", n=len(metas), m=total_msg, s=util.fmt_size(total_size),
                t=util.fmt_tokens(total_tok or None) or "–") + "<br>" +
             tr("stats_l2", c=len(cl), x=len(cx),
                s=sum(1 for m in metas if m.starred),
-               r=sum(1 for m in metas if m.running)))
+               r=sum(1 for m in metas if m.running)) +
+            (("<br>" + extra) if extra else ""))
         head.setStyleSheet(f"color: {theme.TEXT}; font-size: 14px;")
         lay.addWidget(head)
 
@@ -374,7 +382,8 @@ class TransplantDialog(QDialog):
 
         form = QFormLayout()
         self.target = QComboBox()
-        for key in ("claude", "codex", "opencode", "json"):
+        for key in ("claude", "codex", "opencode", "gemini", "qwen", "goose",
+                    "cline", "roo", "json"):
             self.target.addItem(tr("tp_" + key), key)
         idx = self.target.findData(last_target)
         if idx >= 0:

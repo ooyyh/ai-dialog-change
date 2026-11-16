@@ -4,7 +4,7 @@
   uv run adm --selftest parse/scan everything headless + edit round-trip on a copy
   uv run adm --repair   fix claude transcripts with dangling parentUuid/leafUuid
   uv run adm --smoke    launch GUI and auto-close after 4s
-  uv run adm --transplant <id|file> --to claude|codex|opencode|json
+  uv run adm --transplant <id|file> --to claude|codex|opencode|gemini|qwen|goose|cline|roo|json
                         [--cwd DIR] [--title T] [--out DIR]
                         [--no-tools] [--reasoning] [--sidechain]
 """
@@ -346,10 +346,58 @@ def selftest() -> int:
             tp = conv_md.get("transplant")
             if tp:
                 for name in ("convert.bat", "convert.ps1", "convert.sh",
-                             "convert.py", "transplant/claude.jsonl",
+                             "transplant/claude.jsonl",
                              "transplant/codex.jsonl", "transplant/opencode.json",
-                             "transplant/neutral/transcript.json"):
+                             "transplant/gemini.json", "transplant/goose.json",
+                             "transplant/cline/api_conversation_history.json",
+                             "transplant/cline/ui_messages.json",
+                             "transplant/neutral/transcript.json",
+                             "restore.bat", "restore.ps1", "restore.sh",
+                             "restore-claude.bat", "restore-claude.ps1",
+                             "restore-claude.sh", "restore-codex.bat",
+                             "restore-codex.ps1", "restore-codex.sh",
+                             "restore-opencode.bat", "restore-opencode.ps1",
+                             "restore-opencode.sh", "restore-gemini.bat",
+                             "restore-gemini.ps1", "restore-gemini.sh",
+                             "restore-qwen.bat", "restore-qwen.ps1",
+                             "restore-qwen.sh", "restore-goose.bat",
+                             "restore-goose.ps1", "restore-goose.sh",
+                             "restore-cline.bat", "restore-cline.ps1",
+                             "restore-cline.sh", "restore-roo.bat",
+                             "restore-roo.ps1", "restore-roo.sh",
+                             "restore-json.bat",
+                             "restore-json.ps1", "restore-json.sh"):
                     assert (conv_bundle / name).exists(), f"bundle missing {name}"
+                for target in ("claude", "codex", "opencode", "gemini",
+                               "qwen", "goose", "cline", "roo", "json"):
+                    txt = (conv_bundle / f"restore-{target}.bat").read_text(
+                        encoding="utf-8")
+                    assert "__TARGET__" not in txt and target in txt, \
+                        f"restore-{target}.bat was not rendered"
+
+                # One-click restore: convert + read the new id, without
+                # launching anything.  This also exercises convert.ps1.
+                ps = shutil.which("pwsh") or shutil.which("powershell")
+                if ps:
+                    restore_home = tmpdir / "claude-home-restore"
+                    restore_work = (tmpdir / "restored claude").resolve()
+                    env = dict(os.environ)
+                    env["CLAUDE_CONFIG_DIR"] = str(restore_home)
+                    rc = subprocess.call(
+                        [ps, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                         "-File", str(conv_bundle / "restore-claude.ps1"),
+                         str(restore_work), "-NoLaunch"],
+                        env=env, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                    assert rc == 0, f"restore-claude.ps1 failed (rc={rc})"
+                    restored = list(restore_home.rglob(
+                        f"{tp['claude']['id']}.jsonl"))
+                    assert restored, "restore-claude.ps1 did not write a transcript"
+                    rrecs = [json.loads(x) for x in restored[0].read_text(
+                        encoding="utf-8").splitlines() if x.strip()]
+                    assert all(r.get("cwd") in (None, str(restore_work))
+                               for r in rrecs), "restore: cwd not rewritten"
+                    print("   bundle: restore-claude.ps1 -> transcript: OK")
                 conv_work = (tmpdir / "converted codex").resolve()
                 conv_work.mkdir()
                 conv_home = tmpdir / "codex-home-conv"
@@ -384,10 +432,14 @@ def selftest() -> int:
                 # the shell converter must work without Python at all (claude)
                 sh = shutil.which("sh")
                 if sh:
-                    rc = subprocess.call([sh, "-n", str(conv_bundle / "convert.sh")],
-                                         stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL)
-                    assert rc == 0, "convert.sh has a syntax error"
+                    for name in ("convert.sh", "restore.sh",
+                                 "restore-claude.sh", "restore-codex.sh",
+                                 "restore-opencode.sh", "restore-json.sh"):
+                        rc = subprocess.call(
+                            [sh, "-n", str(conv_bundle / name)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+                        assert rc == 0, f"{name} has a syntax error"
                     conv_claude_home = tmpdir / "claude-home-conv"
                     sh_work = tmpdir / "converted claude"
                     sh_work.mkdir()
@@ -421,6 +473,48 @@ def selftest() -> int:
                 os.environ.pop("CLAUDE_CONFIG_DIR", None)
             else:
                 os.environ["CLAUDE_CONFIG_DIR"] = prev_claude_home
+
+    print("== extra session sources ==")
+    from adm import (junie_store, opencode_store, pi_store, qoder_store,
+                     sources)
+    extra = [
+        ("opencode", opencode_store.scan_opencode),
+        ("junie", junie_store.scan_junie),
+        ("pi", pi_store.scan_pi),
+        ("qoder", qoder_store.scan_qoder),
+    ]
+    for label, scanner in extra:
+        try:
+            metas = scanner()
+        except Exception as e:  # noqa: BLE001
+            print(f"   {label}: scan skipped ({e})")
+            continue
+        if not metas:
+            print(f"   {label}: no sessions on this machine")
+            continue
+        m = max(metas, key=lambda x: x.n_messages)
+        sess = sources.load_session(m)
+        assert sess.messages, f"{label}: loader returned no messages"
+        print(f"   {label}: {len(metas)} session(s), "
+              f"first load {len(sess.messages)} msgs: OK")
+    oc_metas = opencode_store.scan_opencode()
+    if oc_metas:
+        big = max(oc_metas, key=lambda x: x.n_messages)
+        sess = sources.load_session(big)
+        neutral = transplant.build_transcript(sess.messages)
+        biggest = max((len(x.text) for x in neutral), default=0)
+        assert len(neutral) > 2 and biggest < 50_000, \
+            "transcript was merged into one giant block"
+        print(f"   granular transcript: {len(sess.messages)} source msgs -> "
+              f"{len(neutral)} neutral, max {biggest} chars: OK")
+    from adm.models import SessionMeta as _SM
+    assert not sources.is_editable("opencode")
+    assert sources.resume_command(
+        _SM(source="opencode", id="ses_x", path="", project="")) == \
+        "opencode --session ses_x"
+    assert sources.resume_command(
+        _SM(source="qoder", id="q", path="", project="")) is None
+    print("   source registry / read-only flag: OK")
 
     _cfg.BACKUP_DIR = orig_backup
     print("SELFTEST", "PASS" if ok else "FAIL")

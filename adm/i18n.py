@@ -4,7 +4,7 @@ from __future__ import annotations
 _LANG = "zh"
 
 ZH = {
-    "app_title": "AI 会话管理器 — Claude & Codex",
+    "app_title": "AI 会话管理器 — 多 AI 工具",
     # toolbar
     "tb_refresh": "⟳ 刷新", "tip_refresh": "重新扫描全部会话 (F5)",
     "tb_search": "🔍 全局搜索", "tip_search": "检索所有会话内容 (Ctrl+Shift+F)",
@@ -13,7 +13,7 @@ ZH = {
     "tb_star": "★ 收藏", "tip_star": "收藏/取消收藏(仅本地,不改原始文件)",
     "tb_rename": "✎ 重命名", "tip_rename": "修改会话标题",
     "tb_dup": "⧉ 复制", "tip_dup": "以新 id 复制会话",
-    "tb_upload": "⤴ 意识上传", "tip_upload": "导出可恢复上传包:同工具用 install.*,换 AI 工具用 convert.*(bat/ps1/sh)",
+    "tb_upload": "⤴ 意识上传", "tip_upload": "Claude/Codex 导出可恢复上传包:同工具 install.*,换 AI 工具 restore-*(一键继续)或 convert.*",
     "tb_transplant": "⤴ 适配其它 AI", "tip_transplant": "把该会话转换成 Claude / Codex / OpenCode 的会话记录(可指定目标工作目录)",
     "tb_arch": "🗂 归档", "tip_arch": "codex: 归档/取消归档",
     "tb_del": "🗑 删除", "tip_del": "删除会话文件(自动备份)",
@@ -77,6 +77,11 @@ ZH = {
     "tp_claude": "Claude Code(本机)",
     "tp_codex": "Codex(本机)",
     "tp_opencode": "OpenCode(本机服务)",
+    "tp_gemini": "Gemini CLI(本机)",
+    "tp_qwen": "Qwen Code(本机)",
+    "tp_goose": "Goose(本机)",
+    "tp_cline": "Cline(VS Code 扩展)",
+    "tp_roo": "Roo Code(VS Code 扩展)",
     "tp_json": "通用 JSON + Markdown(任意工具)",
     "tp_cwd": "目标工作目录:",
     "tp_browse": "浏览…",
@@ -84,7 +89,7 @@ ZH = {
     "tp_tools": "包含工具调用与结果(转为文本)",
     "tp_reasoning": "包含思考过程",
     "tp_sidechain": "包含子代理记录",
-    "tp_note": "原会话不会被修改;新会话使用新的 id 和目录。Claude/Codex 写入本机会话库,OpenCode 通过其本地服务导入。",
+    "tp_note": "原会话不会被修改;新会话使用新的 id 和目录。Claude/Codex/DeepSeek/Qwen/Goose 写入本机会话库,OpenCode 通过其本地服务导入,Cline/Roo 写入 VS Code 扩展的任务目录。",
     "tp_cwd_hint": "工具目标 = 新会话的工作目录;通用 JSON = 输出文件夹(记录里仍保留原目录)",
     "tp_pick": "选择目标工作目录",
     "tp_mkdir_title": "目录不存在",
@@ -104,15 +109,18 @@ ZH = {
                         "  Windows:  install.bat \"<目标工作文件夹>\"\n"
                         "  Linux/macOS:  sh install.sh \"<目标工作文件夹>\"\n"
                         "  (也可以用 install.ps1 / install.py)\n\n"
-                        "【换一个 AI 工具】转换到 Claude / Codex / OpenCode / 通用 JSON:\n"
-                        "  Windows:  convert.bat codex \"<目标工作文件夹>\"\n"
-                        "  Linux/macOS:  sh convert.sh codex \"<目标工作文件夹>\"\n"
+                        "【换一个 AI 工具】转换并直接继续(Claude / Codex / OpenCode / 通用 JSON):\n"
+                        "  Windows:  restore-codex.bat \"<目标工作文件夹>\"\n"
+                        "  Linux/macOS:  sh restore-codex.sh \"<目标工作文件夹>\"\n"
+                        "  也可用 restore-claude / restore-opencode / restore-json,或 restore.bat 菜单;\n"
+                        "  只转换不打开用 convert.bat codex \"<文件夹>\";加 --no-launch 只安装\n"
                         "  目标可选 claude / codex / opencode / json,文件夹不必是原来的\n\n"
-                        "然后在该文件夹启动对应工具,输入 /resume 即可恢复整个会话。",
+                        "restore-* 会直接打开目标工具的新会话;手动进入时用对应 resume 命令。",
     "upload_failed": "上传失败",
     # status
     "ready": "就绪", "scanning": "扫描中…",
     "status_sessions": "{n} 个会话 · claude {c} · codex {x}",
+    "status_sessions_multi": "{n} 个会话 · {counts}",
     "saved_backup": "已保存(已自动备份)",
     "delmsg_done": "消息已删除(已自动备份)",
     "export_done": "已导出 → {path}",
@@ -152,6 +160,10 @@ ZH = {
     "dup_done_title": "已复制", "dup_done_body": "新会话 id:\n{id}",
     "del_sess_title": "删除会话", "del_sess_body": "确定永久删除该会话?\n\n{title}\n{size} · id {id}\n\n备份副本会保留在应用备份目录。",
     "del_failed": "删除失败", "edit_failed": "编辑失败", "append_failed": "追加失败",
+    "readonly_title": "只读来源",
+    "readonly_body": "{source} 会话仅用于浏览、搜索、导出和转生；本应用不会改写它的原始存储。",
+    "readonly_resume": "无法自动恢复 {source} 会话；请在对应应用中打开。",
+    "readonly_upload": "{source} 暂不支持导出可恢复上传包；可先用「⤴ 适配其它 AI」转生。",
     "delmsg_title": "删除消息",
     "delmsg_body": "删除这条 {role} 消息(第 {line} 行)?",
     "delmsg_linked": "\n\n{n} 条关联工具记录将一并删除。",
@@ -179,7 +191,7 @@ ZH = {
 }
 
 EN = {
-    "app_title": "AI Dialog Manager — Claude & Codex sessions",
+    "app_title": "AI Dialog Manager — multi-tool sessions",
     "tb_refresh": "⟳ Refresh", "tip_refresh": "rescan all sessions (F5)",
     "tb_search": "🔍 Global search", "tip_search": "search inside every session (Ctrl+Shift+F)",
     "tb_stats": "📊 Stats", "tip_stats": "session statistics",
@@ -187,7 +199,7 @@ EN = {
     "tb_star": "★ Star", "tip_star": "star/unstar (local, never touches files)",
     "tb_rename": "✎ Rename", "tip_rename": "change session title",
     "tb_dup": "⧉ Duplicate", "tip_dup": "copy session under a new id",
-    "tb_upload": "⤴ Upload", "tip_upload": "export a resumable bundle: install.* for the same tool, convert.* for another AI tool",
+    "tb_upload": "⤴ Upload", "tip_upload": "Claude/Codex only: export a resumable bundle (install.* / restore-* / convert.*)",
     "tb_transplant": "⤴ Transplant", "tip_transplant": "adapt this session into Claude / Codex / OpenCode (choose a new working directory)",
     "tb_arch": "🗂 Archive", "tip_arch": "codex: archive/unarchive",
     "tb_del": "🗑 Delete", "tip_del": "delete session file (backed up first)",
@@ -243,6 +255,11 @@ EN = {
     "tp_claude": "Claude Code (local)",
     "tp_codex": "Codex (local)",
     "tp_opencode": "OpenCode (local service)",
+    "tp_gemini": "Gemini CLI (local)",
+    "tp_qwen": "Qwen Code (local)",
+    "tp_goose": "Goose (local)",
+    "tp_cline": "Cline (VS Code extension)",
+    "tp_roo": "Roo Code (VS Code extension)",
     "tp_json": "Generic JSON + Markdown (any tool)",
     "tp_cwd": "Target working directory:",
     "tp_browse": "Browse…",
@@ -250,7 +267,7 @@ EN = {
     "tp_tools": "Include tool calls/results (as text)",
     "tp_reasoning": "Include thinking/reasoning",
     "tp_sidechain": "Include subagent records",
-    "tp_note": "The source session is never modified; the new session gets a fresh id and directory. Claude/Codex write into the local session store; OpenCode imports through its local service.",
+    "tp_note": "The source session is never modified; the new session gets a fresh id and directory. Claude/Codex/DeepSeek/Qwen/Goose write into the local session store, OpenCode imports through its local service, and Cline/Roo write into the VS Code extension task folders.",
     "tp_cwd_hint": "Tool targets = working directory of the new session; JSON = output folder (the transcript keeps the original dir).",
     "tp_pick": "Choose target working directory",
     "tp_mkdir_title": "Folder does not exist",
@@ -269,15 +286,18 @@ EN = {
                         "  Windows:  install.bat \"<target working folder>\"\n"
                         "  Linux/macOS:  sh install.sh \"<target working folder>\"\n"
                         "  (install.ps1 / install.py also work)\n\n"
-                        "Another AI tool — convert to Claude / Codex / OpenCode / generic JSON:\n"
-                        "  Windows:  convert.bat codex \"<target working folder>\"\n"
-                        "  Linux/macOS:  sh convert.sh codex \"<target working folder>\"\n"
+                        "Another AI tool — convert and continue (Claude / Codex / OpenCode / generic JSON):\n"
+                        "  Windows:  restore-codex.bat \"<target working folder>\"\n"
+                        "  Linux/macOS:  sh restore-codex.sh \"<target working folder>\"\n"
+                        "  also restore-claude / restore-opencode / restore-json, or the restore.bat menu;\n"
+                        "  convert-only: convert.bat codex \"<folder>\"; --no-launch installs without opening\n"
                         "  targets: claude / codex / opencode / json; the folder need not be the original\n\n"
-                        "Then start that tool in the folder and use /resume — "
-                        "the whole session is restored.",
+                        "restore-* opens the new session in the target tool; "
+                        "when starting it manually use the matching resume command.",
     "upload_failed": "Upload failed",
     "ready": "ready", "scanning": "scanning…",
     "status_sessions": "{n} sessions · claude {c} · codex {x}",
+    "status_sessions_multi": "{n} sessions · {counts}",
     "saved_backup": "saved (backup kept)",
     "delmsg_done": "message deleted (backup kept)",
     "export_done": "exported → {path}",
@@ -312,6 +332,10 @@ EN = {
     "del_sess_title": "Delete session",
     "del_sess_body": "Delete this session permanently?\n\n{title}\n{size} · id {id}\n\nA backup copy is kept in the app backup folder.",
     "del_failed": "Delete failed", "edit_failed": "Edit failed", "append_failed": "Append failed",
+    "readonly_title": "Read-only source",
+    "readonly_body": "{source} sessions are available for browsing, search, export and transplant; the app does not rewrite their native store.",
+    "readonly_resume": "Cannot resume a {source} session automatically; open it in the source application.",
+    "readonly_upload": "{source} does not support resumable upload bundles yet; use \"Transplant to another AI\" instead.",
     "delmsg_title": "Delete message",
     "delmsg_body": "Delete this {role} message (line {line})?",
     "delmsg_linked": "\n\n{n} linked tool record(s) will also be removed.",

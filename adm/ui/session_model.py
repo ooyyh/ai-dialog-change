@@ -6,7 +6,7 @@ from datetime import datetime
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
 from PyQt6.QtGui import QColor
 
-from .. import util
+from .. import sources, util
 from ..i18n import tr
 from ..util import MIN_DT
 from ..models import SessionMeta
@@ -106,7 +106,7 @@ class SessionTableModel(QAbstractTableModel):
             if c == 0 and m.starred:
                 return QColor("#e9c46a")
             if c == 1:
-                return QColor("#5b8cff" if m.source == "claude" else "#4ec9a8")
+                return QColor(sources.color(m.source))
             if c == 9:
                 if m.running:
                     return QColor("#5ec269")

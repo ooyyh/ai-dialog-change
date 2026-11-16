@@ -42,17 +42,17 @@ def _connect(path: Path, readonly: bool = True) -> sqlite3.Connection:
 
 # ---------------------------------------------------------------- scan
 
-def scan_codex(progress=None) -> list[SessionMeta]:
+def scan_codex(progress=None, cache=None) -> list[SessionMeta]:
     try:
-        return _scan_sqlite(progress)
+        return _scan_sqlite(progress, cache=cache)
     except sqlite3.Error:
-        return _scan_files(progress)
+        return _scan_files(progress, cache=cache)
 
 
 _count_cache: dict[str, tuple[int, int, int]] = {}  # path -> (mtime_ns, size, count)
 
 
-def _quick_msg_count(path: str) -> int:
+def _quick_msg_count(path: str, cache=None) -> int:
     """Byte-level user+assistant message count; cached by mtime+size.
     Slightly over-counts (includes harness-injected user blocks) — fine for
     a list column, and avoids JSON-parsing 80MB rollouts on every scan."""
@@ -63,6 +63,11 @@ def _quick_msg_count(path: str) -> int:
     hit = _count_cache.get(path)
     if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
         return hit[2]
+    if cache is not None:
+        saved = cache.get_value("codex_count", path, st.st_mtime_ns, st.st_size)
+        if isinstance(saved, int):
+            _count_cache[path] = (st.st_mtime_ns, st.st_size, saved)
+            return saved
     n = 0
     try:
         with open(path, "rb") as f:
@@ -72,10 +77,12 @@ def _quick_msg_count(path: str) -> int:
     except OSError:
         return 0
     _count_cache[path] = (st.st_mtime_ns, st.st_size, n)
+    if cache is not None:
+        cache.put_value("codex_count", path, st.st_mtime_ns, st.st_size, n)
     return n
 
 
-def _scan_sqlite(progress=None) -> list[SessionMeta]:
+def _scan_sqlite(progress=None, cache=None) -> list[SessionMeta]:
     metas: list[SessionMeta] = []
     if progress:
         progress("codex sqlite threads")
@@ -83,12 +90,14 @@ def _scan_sqlite(progress=None) -> list[SessionMeta]:
     now = time.time()
     lock_ids = _locked_thread_ids()
     rows = con.execute("SELECT * FROM threads").fetchall()
+    seen: set[str] = set()
     for k, r in enumerate(rows):
         if progress and k % 10 == 0:
             progress(f"codex counting {k + 1}/{len(rows)}")
         p = r["rollout_path"]
         if not p or not Path(p).exists():
             continue
+        seen.add(str(p))
         cwd = util.strip_verbatim(r["cwd"] or "")
         created = util.ts_from_ms(r["created_at_ms"] or (r["created_at"] or 0) * 1000)
         updated = util.ts_from_ms(r["updated_at_ms"] or (r["updated_at"] or 0) * 1000)
@@ -99,12 +108,14 @@ def _scan_sqlite(progress=None) -> list[SessionMeta]:
             created=created, updated=updated,
             model=r["model"] or "", tokens=r["tokens_used"],
             archived=bool(r["archived"]),
-            n_messages=_quick_msg_count(p),
+            n_messages=_quick_msg_count(p, cache=cache),
             preview=util.one_line(util.collapse_ws(r["first_user_message"] or ""), 100),
         )
         m.running = r["id"] in lock_ids or _recently_touched(p, 180)
         metas.append(m)
     con.close()
+    if cache is not None:
+        cache.prune_values("codex_count", seen)
     return metas
 
 
@@ -129,16 +140,20 @@ def _locked_thread_ids() -> set[str]:
     return out
 
 
-def _scan_files(progress=None) -> list[SessionMeta]:
+def _scan_files(progress=None, cache=None) -> list[SessionMeta]:
     metas: list[SessionMeta] = []
     files = sorted(config.CODEX_SESSIONS.rglob("rollout-*.jsonl"))
+    seen: set[str] = set()
     for n, f in enumerate(files):
         if progress and n % 10 == 0:
             progress(f"codex files {n + 1}/{len(files)}")
+        seen.add(str(f))
         m = _scan_rollout(f)
         if m:
             m.running = _recently_touched(str(f), 180)
             metas.append(m)
+    if cache is not None:
+        cache.prune_values("codex_count", seen)
     return metas
 
 

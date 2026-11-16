@@ -58,7 +58,7 @@ class Message:
 
 @dataclass
 class SessionMeta:
-    source: str            # 'claude' | 'codex'
+    source: str            # claude | codex | opencode | junie | pi | ...
     id: str
     path: str
     project: str           # display project name
@@ -88,7 +88,13 @@ class SessionMeta:
 
     @property
     def source_badge(self) -> str:
-        return "Claude" if self.source == "claude" else "Codex"
+        from . import sources
+        return sources.badge(self.source)
+
+    @property
+    def editable(self) -> bool:
+        from . import sources
+        return sources.is_editable(self.source)
 
 
 @dataclass

@@ -9,7 +9,10 @@ Record types observed:
 from __future__ import annotations
 
 import json
+import os
+import re
 import uuid as uuidlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +21,12 @@ from .jsonlio import SessionEditor
 from .models import LoadedSession, Message, Part, SessionMeta
 
 _DISPLAY_TYPES = {"user", "assistant"}
+_TS_RE = re.compile(rb'"timestamp"\s*:\s*"([^"]+)"')
+_CWD_RE = re.compile(rb'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_MODEL_RE = re.compile(rb'"model"\s*:\s*"([^"]*)"')
+_USER_RE = re.compile(rb'"type"\s*:\s*"user"')
+_ASST_RE = re.compile(rb'"type"\s*:\s*"assistant"')
+_TITLE_RE = re.compile(rb'"type"\s*:\s*"ai-title"')
 
 
 # ---------------------------------------------------------------- scan
@@ -41,71 +50,154 @@ def running_session_ids() -> dict[str, dict]:
     return out
 
 
-def scan_claude(progress=None) -> list[SessionMeta]:
+def scan_claude(progress=None, cache=None) -> list[SessionMeta]:
     metas: list[SessionMeta] = []
     if not config.CLAUDE_PROJECTS.is_dir():
         return metas
     running = running_session_ids()
-    dirs = [d for d in config.CLAUDE_PROJECTS.iterdir() if d.is_dir()]
+    dirs = sorted(d for d in config.CLAUDE_PROJECTS.iterdir() if d.is_dir())
+    jobs: list[tuple[Path, str, int, int]] = []
+    seen: set[str] = set()
     for n, proj in enumerate(dirs):
         if progress:
             progress(f"claude {n + 1}/{len(dirs)} {proj.name}")
         # top-level <sessionId>.jsonl + nested subagent transcripts
         # (projects/<proj>/<sessionId>/subagents/*.jsonl)
-        for f in proj.rglob("*.jsonl"):
-            m = _scan_file(f, proj.name)
-            if not m:
+        for f in sorted(proj.rglob("*.jsonl")):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            p = str(f)
+            seen.add(p)
+            m = cache.get_meta("claude", p, st.st_mtime_ns, st.st_size) \
+                if cache is not None else None
+            if m is not None:
+                m.path = p
+                m.project = proj.name
+                m.size = st.st_size
+            else:
+                jobs.append((f, proj.name, st.st_mtime_ns, st.st_size))
                 continue
             if "subagents" in f.parts:
                 m.subagent = True
+                m.running = False
             else:
+                m.subagent = False
                 m.running = m.id in running
             metas.append(m)
+
+    if jobs:
+        if progress:
+            progress(f"claude parsing {len(jobs)} changed file(s)")
+        workers = min(8, max(1, os.cpu_count() or 4), len(jobs))
+        if workers <= 1:
+            results = ((job, _scan_file(job[0], job[1], _Stat(job[2], job[3])))
+                       for job in jobs)
+            for k, item in enumerate(results):
+                _accept_claude(item, proj_running=running, cache=cache, metas=metas)
+                if progress and k % 20 == 0:
+                    progress(f"claude parsing {k + 1}/{len(jobs)}")
+        else:
+            def work(job):
+                try:
+                    return job, _scan_file(job[0], job[1],
+                                           _Stat(job[2], job[3]))
+                except Exception:  # noqa: BLE001 — one bad file must not stop scan
+                    return job, None
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                for k, item in enumerate(ex.map(work, jobs)):
+                    _accept_claude(item, proj_running=running, cache=cache,
+                                   metas=metas)
+                    if progress and k % 20 == 0:
+                        progress(f"claude parsing {k + 1}/{len(jobs)}")
+    if cache is not None:
+        cache.prune_meta("claude", seen)
     return metas
 
 
-def _scan_file(path: Path, project: str) -> SessionMeta | None:
+class _Stat:
+    """Tiny stand-in for os.stat_result used by _scan_file."""
+    __slots__ = ("st_mtime_ns", "st_size")
+
+    def __init__(self, mtime_ns: int, size: int):
+        self.st_mtime_ns = mtime_ns
+        self.st_size = size
+
+
+def _accept_claude(item, *, proj_running: dict, cache, metas: list) -> None:
+    job, m = item
+    if m is None:
+        return
+    f, project, mtime_ns, size = job
+    m.subagent = "subagents" in f.parts
+    m.running = (not m.subagent) and m.id in proj_running
+    if cache is not None:
+        cache.put_meta("claude", str(f), mtime_ns, size, m)
+    metas.append(m)
+
+
+def _unescape_json_bytes(raw: bytes) -> str:
     try:
-        st = path.stat()
+        return json.loads('"' + raw.decode("utf-8", "replace") + '"')
+    except ValueError:
+        return raw.decode("utf-8", "replace")
+
+
+def _scan_file(path: Path, project: str, st=None) -> SessionMeta | None:
+    try:
+        if st is None:
+            st = path.stat()
         sid = path.stem
         meta = SessionMeta(source="claude", id=sid, path=str(path), project=project,
                            size=st.st_size)
-        title = ""
         first_user = ""
         cwd = ""
         model = ""
         n_user = n_asst = 0
         first_ts = last_ts = None
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if not line or line[0] != "{":
+        with open(path, "rb") as f:
+            for raw in f:
+                is_user = _USER_RE.search(raw) is not None
+                is_asst = _ASST_RE.search(raw) is not None
+                is_title = _TITLE_RE.search(raw) is not None
+                if not (is_user or is_asst or is_title):
                     continue
-                try:
-                    o = json.loads(line)
-                except ValueError:
+                ts_m = _TS_RE.search(raw)
+                if ts_m:
+                    ts = util.parse_iso(ts_m.group(1).decode("utf-8", "replace"))
+                    if ts:
+                        if first_ts is None:
+                            first_ts = ts
+                        last_ts = ts
+                if is_title:
+                    try:
+                        o = json.loads(raw.decode("utf-8", "replace"))
+                        meta.title = o.get("aiTitle") or meta.title
+                    except ValueError:
+                        pass
                     continue
-                t = o.get("type")
-                if t == "ai-title":
-                    meta.title = o.get("aiTitle") or meta.title
-                    continue
-                if t not in _DISPLAY_TYPES:
-                    continue
-                ts = util.parse_iso(o.get("timestamp"))
-                if ts:
-                    if first_ts is None:
-                        first_ts = ts
-                    last_ts = ts
-                if not cwd:
-                    cwd = o.get("cwd") or ""
-                msg = o.get("message") or {}
-                if not model and msg.get("model"):
-                    model = msg["model"]
-                if o.get("type") == "user" and not o.get("isMeta") and not o.get("isSidechain"):
+                if is_user:
+                    try:
+                        o = json.loads(raw.decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    if o.get("isMeta") or o.get("isSidechain"):
+                        continue
                     n_user += 1
                     if not first_user:
-                        first_user = _user_text(msg)
-                elif o.get("type") == "assistant":
+                        first_user = _user_text(o.get("message") or {})
+                elif is_asst:
                     n_asst += 1
+                if not cwd:
+                    m = _CWD_RE.search(raw)
+                    if m:
+                        cwd = _unescape_json_bytes(m.group(1))
+                if not model:
+                    m = _MODEL_RE.search(raw)
+                    if m:
+                        model = m.group(1).decode("utf-8", "replace")
         meta.n_user, meta.n_assistant = n_user, n_asst
         meta.n_messages = n_user + n_asst
         meta.created, meta.updated = first_ts, last_ts or first_ts

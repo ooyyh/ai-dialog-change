@@ -13,7 +13,20 @@ A bundle is one self-contained folder:
       convert.ps1      Windows PowerShell converter
       convert.sh       Linux / macOS converter (POSIX sh)
       convert.py       universal converter (Python 3, stdlib only)
-      transplant/      pre-rendered claude / codex / opencode / neutral JSON
+      restore-claude.* restore the converted session and continue it in Claude
+      restore-codex.*  restore the converted session and continue it in Codex
+      restore-opencode.* restore the converted session and continue it in OpenCode
+      restore-gemini.* restore into DeepSeek CLI (same format as Qwen Code)
+      restore-qwen.*   restore into Qwen Code
+      restore-goose.*  restore into Goose
+      restore-cline.*  restore into Cline (VS Code extension)
+      restore-roo.*    restore into Roo Code (VS Code extension)
+      restore-json.*   write a neutral transcript for any other AI tool
+      restore.bat      Windows CMD menu / entry point
+      restore.ps1      Windows PowerShell restore helper
+      restore.sh       Linux / macOS restore helper
+      transplant/      pre-rendered claude / codex / opencode / gemini /
+                       goose / cline / neutral JSON transcripts
       README.md        bilingual instructions
       subagents/       Claude sidechain transcripts (when present)
 
@@ -22,7 +35,9 @@ CLI session store with a fresh session id and cwd rewritten, so ``claude`` /
 ``codex`` started in the working folder lists it under ``/resume``.  The
 convert.* scripts instead write a *converted* transcript — e.g. a Claude
 session transplanted into Codex, OpenCode or a neutral JSON transcript — into
-any working folder the user chooses.
+any working folder the user chooses.  The restore-* scripts do the same and
+then reopen the target CLI on the new session (``claude --resume``,
+``codex resume``, ``opencode --session``).
 """
 from __future__ import annotations
 
@@ -165,6 +180,32 @@ def _export_transplant(meta: SessionMeta, bundle: Path) -> dict | None:
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
         encoding="utf-8", newline="\n")
 
+    gem_id = str(uuidlib.uuid4())
+    gem = transplant.build_gemini_session(
+        messages, title, ph, model=meta.model or "", sid=gem_id)
+    (out / "gemini.json").write_text(
+        json.dumps(gem, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n")
+
+    goose = transplant.build_goose_session(messages, title, ph)
+    (out / "goose.json").write_text(
+        json.dumps(goose, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n")
+
+    cline_id, cline_hist, cline_ui, cline_meta = \
+        transplant.build_cline_task(messages, title, ph)
+    cline_dir = out / "cline"
+    cline_dir.mkdir()
+    (cline_dir / "api_conversation_history.json").write_text(
+        json.dumps(cline_hist, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n")
+    (cline_dir / "ui_messages.json").write_text(
+        json.dumps(cline_ui, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n")
+    (cline_dir / "task_metadata.json").write_text(
+        json.dumps(cline_meta, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n")
+
     neutral = out / "neutral"
     neutral.mkdir()
     doc, md, readme = transplant.build_generic_transcript(
@@ -184,6 +225,11 @@ def _export_transplant(meta: SessionMeta, bundle: Path) -> dict | None:
                   "name": codex_name},
         "opencode": {"id": payload["info"]["id"],
                      "file": "transplant/opencode.json"},
+        "gemini": {"id": gem_id, "file": "transplant/gemini.json"},
+        "qwen": {"id": gem_id, "file": "transplant/gemini.json"},
+        "goose": {"id": goose["id"], "file": "transplant/goose.json"},
+        "cline": {"id": cline_id, "dir": "transplant/cline"},
+        "roo": {"id": cline_id, "dir": "transplant/cline"},
         "json": {"dir": "transplant/neutral"},
     }
 
@@ -191,6 +237,10 @@ def _export_transplant(meta: SessionMeta, bundle: Path) -> dict | None:
 def export_session(meta: SessionMeta, dest_root: Path,
                    *, new_id: str | None = None) -> Path:
     """Write one portable bundle under dest_root and return its folder."""
+    if meta.source not in ("claude", "codex"):
+        raise ValueError(
+            f"portable upload bundles support Claude/Codex only; "
+            f"{meta.source} can be transplanted to another AI tool instead")
     dest_root = Path(dest_root)
     dest_root.mkdir(parents=True, exist_ok=True)
     sid = new_id or (str(uuidlib.uuid4()) if meta.source == "claude"
@@ -267,7 +317,44 @@ def export_session(meta: SessionMeta, dest_root: Path,
             CONVERT_SH, encoding="utf-8", newline="\n")
         (bundle / "convert.py").write_text(
             CONVERT_PY, encoding="utf-8", newline="\n")
+        _write_restore_scripts(bundle)
     return bundle
+
+
+# One-click "restore into X and continue" wrappers.  They reuse convert.*
+# for the actual transplant, then relaunch the target CLI on the new id.
+RESTORE_TARGETS = (
+    ("claude", "Claude Code"),
+    ("codex", "Codex"),
+    ("opencode", "OpenCode"),
+    ("gemini", "DeepSeek CLI"),
+    ("qwen", "Qwen Code"),
+    ("goose", "Goose"),
+    ("cline", "Cline (VS Code)"),
+    ("roo", "Roo Code (VS Code)"),
+    ("json", "generic JSON / Markdown"),
+)
+
+
+def _write_restore_scripts(bundle: Path) -> None:
+    (bundle / "restore.ps1").write_text(
+        RESTORE_PS1, encoding="utf-8", newline="\n")
+    (bundle / "restore.bat").write_text(
+        RESTORE_BAT, encoding="utf-8", newline="\r\n")
+    (bundle / "restore.sh").write_text(
+        RESTORE_SH, encoding="utf-8", newline="\n")
+    for target, label in RESTORE_TARGETS:
+        for ext in ("bat", "ps1", "sh"):
+            template = {
+                "bat": RESTORE_TARGET_BAT,
+                "ps1": RESTORE_TARGET_PS1,
+                "sh": RESTORE_TARGET_SH,
+            }[ext]
+            text = (template.replace("__TARGET__", target)
+                    .replace("__LABEL__", label))
+            newline = "\r\n" if ext == "bat" else "\n"
+            (bundle / f"restore-{target}.{ext}").write_text(
+                text, encoding="utf-8", newline=newline)
 
 
 def _one_line(s: str, limit: int) -> str:
@@ -344,29 +431,78 @@ def _readme(md: dict) -> str:
 包内已预渲染好各目标的会话记录(`transplant/`),目标机器不需要装本应用。
 Every target transcript is pre-rendered in `transplant/` — no app needed here.
 
+### 一键恢复并继续 / One-click restore and continue
+
+```bat
+:: Windows — 转换 + 直接打开目标工具的新会话
+restore-codex.bat "D:\\hello"
+restore-opencode.bat "D:\\hello"
+restore-claude.bat "D:\\hello"
+restore-gemini.bat "D:\\hello"
+restore-qwen.bat "D:\\hello"
+restore-goose.bat "D:\\hello"
+restore-cline.bat "D:\\hello"
+restore-roo.bat "D:\\hello"
+restore-json.bat "D:\\hello"
+restore.bat
+```
+
+```sh
+# Linux / macOS — 转换 + 直接进入目标工具的新会话
+sh restore-codex.sh "/home/user/hello"
+sh restore-opencode.sh "/home/user/hello"
+sh restore-claude.sh "/home/user/hello"
+sh restore-gemini.sh "/home/user/hello"
+sh restore-qwen.sh "/home/user/hello"
+sh restore-goose.sh "/home/user/hello"
+sh restore-json.sh "/home/user/hello"
+```
+
+- `restore-codex` / `restore-opencode` / `restore-claude` 会转换记录,然后分别执行
+  `codex resume <id>` / `opencode --session <id>` / `claude --resume <id>`。
+- `restore-gemini` / `restore-qwen` / `restore-goose` 分别执行
+  `gemini --resume <id>` / `qwen --resume <id>` / `goose session --resume --name <id>`。
+- `restore-cline` / `restore-roo` 只安装到 VS Code 扩展的任务目录,然后在历史列表里打开。
+- `restore-json` 只写出通用 `transcript.json` + `transcript.md`,交给任意其它 AI 工具。
+- 新增目标(gemini/qwen/goose/cline/roo)在 Windows 的 `convert.ps1` 下需要 Python 3;
+  Linux/macOS 的 `convert.sh` 同样优先调用 `convert.py`。
+- 不想自动打开时加 `--no-launch`(PowerShell 为 `-NoLaunch`),只安装并打印命令。
+- 重复安装同一个包时加 `--force`(PowerShell 为 `-Force`),覆盖包内固定的目标 id。
+- 高级用户仍可直接用 `convert.*`:
+
 ```bat
 :: Windows
 convert.bat codex "D:\\hello"
 convert.bat claude "D:\\hello"
+convert.bat gemini "D:\\hello"
+convert.bat goose "D:\\hello"
 ```
 
 ```sh
 # Linux / macOS
 sh convert.sh codex "/home/user/hello"
 sh convert.sh json "/home/user/hello"
+sh convert.sh cline "/home/user/hello"
 ```
 
 | 目标 / target | 结果 / result | 继续 / continue |
 |---|---|---|
-| `claude` | `~/.claude/projects/<转义目录>/<id>.jsonl` | 在目录里 `claude` → `/resume` |
-| `codex` | `~/.codex/sessions/年/月/日/rollout-*.jsonl` + sqlite 登记 | 在目录里 `codex` → `/resume` |
-| `opencode` | 通过本机 OpenCode 服务导入(POST `/api/experimental/session/import`) | 在目录里 `opencode`,从列表选 |
+| `claude` | `~/.claude/projects/<转义目录>/<id>.jsonl` | `claude --resume <id>` |
+| `codex` | `~/.codex/sessions/年/月/日/rollout-*.jsonl` + sqlite 登记 | `codex resume <id>` |
+| `opencode` | 通过本机 OpenCode 服务导入(POST `/api/experimental/session/import`) | `opencode --session <id>` |
+| `gemini` | `~/.gemini/tmp/<sha256(目录)>/chats/session-*.json` | `gemini --resume <id>` |
+| `qwen` | `~/.qwen/tmp/<sha256(目录)>/chats/session-*.json` | `qwen --resume <id>` |
+| `goose` | `~/.local/share/goose/sessions/<id>.json`(Windows `%APPDATA%\\Block\\goose\\data\\sessions`) | `goose session --resume --name <id>` |
+| `cline` | VS Code `globalStorage/saoudrizwan.claude-dev/tasks/<id>/` | 打开 VS Code → Cline → 历史 |
+| `roo` | VS Code `globalStorage/rooveterinaryinc.roo-cline/tasks/<id>/` | 打开 VS Code → Roo Code → 历史 |
 | `json` | `<目录>/<标题>-<id8>/transcript.json` + `.md` + `README.md` | 交给任意工具/代理 |
 
 - 目标工作目录可以和原始目录完全不同(例如原 `E:\\test` → 新 `D:\\hello`)。
 - 工具调用/结果已转成可读文本:目标工具不认识源工具的 tool schema,原样保留会导致恢复后请求报错。
-- 转换后新 id:`claude` `{tp["claude"]["id"]}` · `codex` `{tp["codex"]["id"]}` · `opencode` `{tp["opencode"]["id"]}`
-- 选项:`--dry-run` / `--force`(ps1 为 `-DryRun` / `-Force`),Codex 可用 `CODEX_HOME` / `CODEX_STATE_DB` 覆盖。
+- 转换按源消息的文本/思考/工具调用/工具结果拆分;一次工具调用和它的结果放在同一条,不会把整段对话合并成一个巨大消息块。
+- 转换后新 id:`claude` `{tp["claude"]["id"]}` · `codex` `{tp["codex"]["id"]}` · `opencode` `{tp["opencode"]["id"]}` · `gemini/qwen` `{tp["gemini"]["id"]}` · `goose` `{tp["goose"]["id"]}` · `cline/roo` `{tp["cline"]["id"]}`
+- 选项:`--dry-run` / `--force`(ps1 为 `-DryRun` / `-Force`),Codex 可用 `CODEX_HOME` / `CODEX_STATE_DB` 覆盖;
+  新目标可用 `GEMINI_CLI_HOME` / `QWEN_HOME` / `GOOSE_HOME`,或用 `convert.py --gemini-home/--qwen-home/--goose-home/--vscode-storage`。
 
 换工具也可以不用脚本,直接在 App 里选中会话 → 工具栏「⤴ 适配其它 AI」。
 """
@@ -447,7 +583,13 @@ English:
 - `install.sh` — Linux / macOS 安装器
 - `install.py` — 通用备用安装器(Python 3,无第三方依赖)
 - `convert.bat` / `convert.ps1` / `convert.sh` / `convert.py` — 换 AI 工具的转换器
-- `transplant/` — 预渲染的 claude / codex / opencode / 中立 JSON 记录
+- `restore-claude.*` / `restore-codex.*` / `restore-opencode.*`
+  / `restore-gemini.*` / `restore-qwen.*` / `restore-goose.*`
+  / `restore-cline.*` / `restore-roo.*` / `restore-json.*`
+  — 一键“转换 + 继续”脚本(`.bat` / `.ps1` / `.sh`)
+- `restore.bat` / `restore.ps1` / `restore.sh` — 带菜单的统一恢复入口
+- `transplant/` — 预渲染的 claude / codex / opencode / 中立 JSON 记录,
+  外加 `gemini.json`、`goose.json`、`cline/`(DeepSeek / Qwen / Goose / Cline 共用)
 - `subagents/` — Claude 子代理记录(如有)
 
 原始会话不会被修改 / the source session is never modified.
@@ -973,7 +1115,7 @@ INSTALL_SH = r'''#!/bin/sh
 #   WORKDIR defaults to the current directory.
 set -u
 
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 SOURCE=__SOURCE__
 NEW_ID=__NEW_ID__
 ORIG_CWD_JSON=__ORIG_CWD_JSON__
@@ -1211,6 +1353,11 @@ CONVERT_PY = r'''#!/usr/bin/env python3
     python convert.py claude   [--cwd DIR]
     python convert.py codex    [--cwd DIR]
     python convert.py opencode [--cwd DIR]
+    python convert.py gemini   [--cwd DIR]
+    python convert.py qwen     [--cwd DIR]
+    python convert.py goose    [--cwd DIR]
+    python convert.py cline    [--cwd DIR]
+    python convert.py roo      [--cwd DIR]
     python convert.py json     [--cwd DIR]
 
 Reading only the bundle: the transcript for every target was rendered at
@@ -1221,6 +1368,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -1459,6 +1607,111 @@ def install_opencode(md: dict, cwd: str, a) -> int:
     return 0
 
 
+def _gem_home(a, tool: str) -> Path:
+    override = a.gemini_home if tool == "gemini" else a.qwen_home
+    if override:
+        return Path(override).expanduser()
+    env = os.environ.get("GEMINI_CLI_HOME" if tool == "gemini"
+                         else "QWEN_HOME")
+    return Path(env).expanduser() if env else Path.home() / f".{tool}"
+
+
+def install_gemini(md: dict, cwd: str, a, tool: str = "gemini") -> int:
+    t = md["transplant"][tool]
+    sid = a.id or t["id"]
+    doc = json.loads(render(HERE / t["file"], cwd))
+    doc["sessionId"] = sid
+    doc["projectHash"] = hashlib.sha256(cwd.encode("utf-8")).hexdigest()
+    doc["lastUpdated"] = datetime.now().isoformat() + "Z"
+    stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    dest = (_gem_home(a, tool) / "tmp" / doc["projectHash"] / "chats"
+            / f"session-{stamp}-{sid}.json")
+    text = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+    write(dest, text, a.dry_run, a.force)
+    print(f"\n{tool} session '{sid}' installed for:\n  {cwd}")
+    print(f"Afterwards run:  {tool} --resume {sid}")
+    return 0
+
+
+def _goose_home(a) -> Path:
+    if a.goose_home:
+        return Path(a.goose_home).expanduser()
+    if os.environ.get("GOOSE_HOME"):
+        return Path(os.environ["GOOSE_HOME"]).expanduser()
+    if os.name == "nt":
+        appdata = Path(os.environ.get("APPDATA")
+                       or Path.home() / "AppData" / "Roaming")
+        cands = [appdata / "Block" / "goose" / "data" / "sessions",
+                 appdata / "goose" / "data" / "sessions",
+                 appdata / "Block" / "goose" / "sessions",
+                 appdata / "goose" / "sessions"]
+        for c in cands:
+            if c.exists() or c.parent.exists():
+                return c
+        return cands[0]
+    base = Path(os.environ.get("XDG_DATA_HOME")
+                or Path.home() / ".local" / "share")
+    return base / "goose" / "sessions"
+
+
+def install_goose(md: dict, cwd: str, a) -> int:
+    t = md["transplant"]["goose"]
+    sid = a.id or t["id"]
+    doc = json.loads(render(HERE / t["file"], cwd))
+    doc["id"] = sid
+    doc["working_dir"] = cwd
+    dest = _goose_home(a) / f"{sid}.json"
+    text = json.dumps(doc, ensure_ascii=False, indent=2) + "\n"
+    write(dest, text, a.dry_run, a.force)
+    print(f"\nGoose session '{sid}' installed for:\n  {cwd}")
+    print(f"Afterwards run:  goose session --resume --name {sid}")
+    return 0
+
+
+def _vscode_storage(a) -> Path:
+    if a.vscode_storage:
+        return Path(a.vscode_storage).expanduser()
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA")
+                    or Path.home() / "AppData" / "Roaming")
+        stable = base / "Code" / "User" / "globalStorage"
+        insiders = base / "Code - Insiders" / "User" / "globalStorage"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+        stable = base / "Code" / "User" / "globalStorage"
+        insiders = base / "Code - Insiders" / "User" / "globalStorage"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME")
+                    or Path.home() / ".config")
+        stable = base / "Code" / "User" / "globalStorage"
+        insiders = base / "Code - Insiders" / "User" / "globalStorage"
+    return insiders if (not stable.exists() and insiders.exists()) else stable
+
+
+def install_cline(md: dict, cwd: str, a, tool: str = "cline") -> int:
+    t = md["transplant"][tool]
+    sid = a.id or t["id"]
+    ext = ("saoudrizwan.claude-dev" if tool == "cline"
+           else "rooveterinaryinc.roo-cline")
+    dest = _vscode_storage(a) / ext / "tasks" / sid
+    src = HERE / t["dir"]
+    names = ("api_conversation_history.json", "ui_messages.json",
+             "task_metadata.json")
+    if a.dry_run:
+        print(f"DRY-RUN would write the {tool} task to {dest}")
+        return 0
+    if dest.exists() and not a.force:
+        sys.exit(f"refusing to overwrite: {dest} (use --force)")
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        text = render(src / name, cwd)
+        (dest / name).write_text(text, encoding="utf-8", newline="\n")
+        print(f"write {dest / name}")
+    print(f"\n{tool} task '{sid}' installed for:\n  {cwd}")
+    print("Open VS Code, then the extension's history list to continue it.")
+    return 0
+
+
 def install_json(md: dict, cwd: str, a) -> int:
     t = md["transplant"]["json"]
     src = HERE / t["dir"]
@@ -1479,12 +1732,17 @@ def install_json(md: dict, cwd: str, a) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Transplant this bundle")
-    ap.add_argument("target", choices=["claude", "codex", "opencode", "json"])
+    ap.add_argument("target", choices=["claude", "codex", "opencode", "gemini",
+                                       "qwen", "goose", "cline", "roo", "json"])
     ap.add_argument("--cwd", default=os.getcwd())
     ap.add_argument("--id", default=None)
     ap.add_argument("--claude-home", default=None)
     ap.add_argument("--codex-home", default=None)
     ap.add_argument("--state-db", default=None)
+    ap.add_argument("--gemini-home", default=None)
+    ap.add_argument("--qwen-home", default=None)
+    ap.add_argument("--goose-home", default=None)
+    ap.add_argument("--vscode-storage", default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
@@ -1498,6 +1756,11 @@ def main() -> int:
         "claude": install_claude,
         "codex": install_codex,
         "opencode": install_opencode,
+        "gemini": lambda m, c, x: install_gemini(m, c, x, "gemini"),
+        "qwen": lambda m, c, x: install_gemini(m, c, x, "qwen"),
+        "goose": install_goose,
+        "cline": lambda m, c, x: install_cline(m, c, x, "cline"),
+        "roo": lambda m, c, x: install_cline(m, c, x, "roo"),
         "json": install_json,
     }[a.target](md, cwd, a)
 
@@ -1509,7 +1772,7 @@ if __name__ == "__main__":
 
 CONVERT_BAT = r'''@echo off
 rem Transplant this bundle into another AI tool.
-rem Usage: convert.bat claude|codex|opencode|json ["target working folder"]
+rem Usage: convert.bat claude|codex|opencode|gemini|qwen|goose|cline|roo|json ["target working folder"]
 setlocal
 set "HERE=%~dp0"
 if "%~1"=="" goto :usage
@@ -1530,7 +1793,7 @@ pause
 exit /b %RC%
 
 :usage
-echo usage: convert.bat claude^|codex^|opencode^|json ["target working folder"]
+echo usage: convert.bat claude^|codex^|opencode^|gemini^|qwen^|goose^|cline^|roo^|json ["target working folder"]
 exit /b 2
 '''
 
@@ -1538,11 +1801,11 @@ exit /b 2
 # Windows PowerShell cross-tool converter. ASCII only (see INSTALL_PS1).
 CONVERT_PS1 = r'''# Transplant this bundle into another AI tool.
 # Usage:
-#   powershell -ExecutionPolicy Bypass -File convert.ps1 -Target claude|codex|opencode|json
+#   powershell -ExecutionPolicy Bypass -File convert.ps1 -Target claude|codex|opencode|gemini|qwen|goose|cline|roo|json
 #       [-Cwd DIR] [-Id ID] [-ClaudeHome DIR] [-CodexHome DIR] [-StateDb FILE]
 #       [-DryRun] [-Force]
 param(
-    [Parameter(Mandatory = $true)][ValidateSet("claude","codex","opencode","json")]
+    [Parameter(Mandatory = $true)][ValidateSet("claude","codex","opencode","gemini","qwen","goose","cline","roo","json")]
     [string]$Target,
     [string]$Cwd = "",
     [string]$Id = "",
@@ -1764,10 +2027,31 @@ function Convert-Json {
     Write-Host ("Portable transcript written to: " + $dest)
 }
 
+function Convert-ViaPython([string]$target) {
+    $py = Find-Python
+    if (-not $py) {
+        throw ($target + " needs Python 3 on this machine; install Python " +
+               "or run convert.py manually")
+    }
+    $a = @((Join-Path $Here "convert.py"), $target, "--cwd", $work)
+    if ($Id) { $a += @("--id", $Id) }
+    if ($DryRun) { $a += "--dry-run" }
+    if ($Force) { $a += "--force" }
+    & $py @a
+    if ($LASTEXITCODE -ne 0) {
+        throw ("convert.py " + $target + " failed with exit code " + $LASTEXITCODE)
+    }
+}
+
 switch ($Target) {
     "claude"   { Convert-Claude }
     "codex"    { Convert-Codex }
     "opencode" { Convert-OpenCode }
+    "gemini"   { Convert-ViaPython "gemini" }
+    "qwen"     { Convert-ViaPython "qwen" }
+    "goose"    { Convert-ViaPython "goose" }
+    "cline"    { Convert-ViaPython "cline" }
+    "roo"      { Convert-ViaPython "roo" }
     "json"     { Convert-Json }
 }
 '''
@@ -1778,11 +2062,11 @@ switch ($Target) {
 # OpenCode uses curl.
 CONVERT_SH = r'''#!/bin/sh
 # Transplant this bundle into another AI tool.
-# Usage: sh convert.sh claude|codex|opencode|json [WORKDIR] [--dry-run] [--force]
+# Usage: sh convert.sh claude|codex|opencode|gemini|qwen|goose|cline|roo|json [WORKDIR] [--dry-run] [--force]
 #   WORKDIR defaults to the current directory.
 set -u
 
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 PH='__ADM_TARGET_CWD__'
 TARGET=""
 CWD="$PWD"
@@ -1790,12 +2074,12 @@ DRY=0
 FORCE=0
 
 usage() {
-    echo "usage: sh convert.sh claude|codex|opencode|json [WORKDIR] [--dry-run] [--force]"
+    echo "usage: sh convert.sh claude|codex|opencode|gemini|qwen|goose|cline|roo|json [WORKDIR] [--dry-run] [--force]"
 }
 
 for arg in "$@"; do
     case "$arg" in
-        claude|codex|opencode|json) TARGET="$arg" ;;
+        claude|codex|opencode|gemini|qwen|goose|cline|roo|json) TARGET="$arg" ;;
         --dry-run) DRY=1 ;;
         --force) FORCE=1 ;;
         -h|--help) usage; exit 0 ;;
@@ -2010,10 +2294,473 @@ do_json() {
     echo "Portable transcript written to: $dst"
 }
 
+do_via_python() {
+    t=$1
+    py=$(find_python || true)
+    if [ -z "$py" ]; then
+        echo "$t needs Python 3 on this machine; install Python or run convert.py manually" >&2
+        return 1
+    fi
+    pyargs=""
+    [ "$DRY" = 1 ] && pyargs="$pyargs --dry-run"
+    [ "$FORCE" = 1 ] && pyargs="$pyargs --force"
+    # shellcheck disable=SC2086
+    "$py" "$HERE/convert.py" "$t" --cwd "$CWD" $pyargs
+}
+
 case "$TARGET" in
     claude) do_claude ;;
     codex) do_codex ;;
     opencode) do_opencode ;;
+    gemini|qwen|goose|cline|roo) do_via_python "$TARGET" ;;
     json) do_json ;;
 esac
+'''
+
+
+# ---------------------------------------------------------------------------
+# One-click restore / continue scripts.  convert.* only installs the
+# transcript; these wrappers also reopen the target CLI on the new session.
+# They are deliberately thin: all conversion lives in convert.*.
+# ---------------------------------------------------------------------------
+
+RESTORE_PS1 = r'''# Restore this bundle into another AI tool and continue the session.
+# Usage:
+#   powershell -ExecutionPolicy Bypass -File restore.ps1 -Target claude|codex|opencode|gemini|qwen|goose|cline|roo|json
+#       [-Cwd DIR] [-Id ID] [-ClaudeHome DIR] [-CodexHome DIR] [-StateDb FILE]
+#       [-NoLaunch] [-Force] [-DryRun]
+# The transplant itself is done by convert.ps1; this script only adds the
+# "resume the new session in a new terminal" step.
+param(
+    [Parameter(Mandatory = $true)][ValidateSet("claude","codex","opencode","gemini","qwen","goose","cline","roo","json")]
+    [string]$Target,
+    [string]$Cwd = "",
+    [string]$Id = "",
+    [string]$ClaudeHome = "",
+    [string]$CodexHome = "",
+    [string]$StateDb = "",
+    [switch]$NoLaunch,
+    [switch]$Force,
+    [switch]$DryRun
+)
+
+$ErrorActionPreference = "Stop"
+$Here = $PSScriptRoot
+if (-not $Here) { $Here = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$Conv = Join-Path $Here "convert.ps1"
+if (-not (Test-Path -LiteralPath $Conv)) {
+    throw "convert.ps1 not found next to restore.ps1 ($Here)"
+}
+$MetaPath = Join-Path $Here "metadata.json"
+if (-not (Test-Path -LiteralPath $MetaPath)) {
+    throw "metadata.json not found next to restore.ps1 ($Here)"
+}
+$meta = Get-Content -LiteralPath $MetaPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if (-not $meta.transplant) { throw "this bundle carries no cross-tool transcripts" }
+
+# Resolve the working folder the same way convert.ps1 does.
+if ($Cwd) { $work = [System.IO.Path]::GetFullPath($Cwd) }
+else { $work = [System.IO.Path]::GetFullPath((Get-Location).Path) }
+if (-not (Test-Path -LiteralPath $work)) {
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+}
+$trimmed = $work.TrimEnd([char[]]@("\", "/"))
+if ($trimmed -match "^[A-Za-z]:$") { $work = $trimmed + "\" } else { $work = $trimmed }
+
+$convArgs = @{ Target = $Target; Cwd = $work }
+if ($Id) { $convArgs["Id"] = $Id }
+if ($ClaudeHome) { $convArgs["ClaudeHome"] = $ClaudeHome }
+if ($CodexHome) { $convArgs["CodexHome"] = $CodexHome }
+if ($StateDb) { $convArgs["StateDb"] = $StateDb }
+if ($Force) { $convArgs["Force"] = $true }
+if ($DryRun) { $convArgs["DryRun"] = $true }
+try {
+    & $Conv @convArgs
+} catch {
+    Write-Host ("Restore failed: " + $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
+
+if ($DryRun) { return }
+if ($Target -eq "json") { return }
+
+$t = $meta.transplant.$Target
+$sid = if ($Id -and $Target -ne "opencode") { $Id } else { [string]$t.id }
+if (-not $sid) {
+    Write-Warning "could not read the new session id from metadata.json"
+    return
+}
+
+$tool = ""
+$cmd = ""
+switch ($Target) {
+    "claude" {
+        $tool = "claude"
+        $cmd = "claude --resume `"$sid`""
+    }
+    "codex" {
+        $tool = "codex"
+        $cmd = "codex resume `"$sid`""
+    }
+    "opencode" {
+        $tool = "opencode"
+        $cmd = "opencode --session `"$sid`""
+    }
+    "gemini" {
+        $tool = "gemini"
+        $cmd = "gemini --resume `"$sid`""
+    }
+    "qwen" {
+        $tool = "qwen"
+        $cmd = "qwen --resume `"$sid`""
+    }
+    "goose" {
+        $tool = "goose"
+        $cmd = "goose session --resume --name `"$sid`""
+    }
+    "cline" {
+        $tool = ""
+        $cmd = "Open VS Code -> Cline -> History"
+    }
+    "roo" {
+        $tool = ""
+        $cmd = "Open VS Code -> Roo Code -> History"
+    }
+}
+
+Write-Host ""
+Write-Host ("Session id: " + $sid)
+Write-Host ("Working folder: " + $work)
+Write-Host ("Resume with: " + $cmd)
+if ($NoLaunch) {
+    Write-Host "Re-run without -NoLaunch to open it automatically."
+    return
+}
+if (-not $tool) {
+    Write-Host "The transcript is installed; open the extension history list to continue."
+    return
+}
+
+if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+    Write-Warning ("$tool is not on PATH; run the command above manually")
+    return
+}
+$shell = Get-Command "pwsh.exe" -ErrorAction SilentlyContinue
+if (-not $shell) { $shell = Get-Command "powershell.exe" -ErrorAction SilentlyContinue }
+if (-not $shell) { $shell = Get-Command "pwsh" -ErrorAction SilentlyContinue }
+if (-not $shell) { $shell = Get-Command "powershell" -ErrorAction SilentlyContinue }
+if (-not $shell) {
+    Write-Warning "PowerShell not found; run the command above manually"
+    return
+}
+
+# Use a small launcher file instead of -Command so paths with spaces and
+# non-ASCII characters survive intact in Windows PowerShell 5.1.
+$quoted = $work.Replace("'", "''")
+$body = "Set-Location -LiteralPath '" + $quoted + "'`r`n" + $cmd + "`r`n"
+$launcher = Join-Path ([System.IO.Path]::GetTempPath()) `
+    ("adm-restore-" + [guid]::NewGuid().ToString("N") + ".ps1")
+[System.IO.File]::WriteAllText(
+    $launcher, $body, (New-Object System.Text.UTF8Encoding($true)))
+$argLine = '-NoExit -ExecutionPolicy Bypass -File "' + $launcher + '"'
+Start-Process -FilePath $shell.Source -ArgumentList $argLine `
+    -WorkingDirectory $work | Out-Null
+Write-Host "Opened a new terminal with the resumed session."
+'''
+
+
+RESTORE_BAT = r'''@echo off
+rem Restore this session into another AI tool and continue it.
+rem Usage: restore.bat [claude^|codex^|opencode^|gemini^|qwen^|goose^|cline^|roo^|json] ["working folder"]
+rem                    [--no-launch] [--force] [--dry-run]
+rem        restore.bat            (interactive menu)
+setlocal EnableExtensions
+set "HERE=%~dp0"
+if "%~1"=="" goto :menu
+if /I "%~1"=="--help" goto :usage
+if /I "%~1"=="-h" goto :usage
+set "TARGET=%~1"
+if /I "%TARGET%"=="claude" goto :run
+if /I "%TARGET%"=="codex" goto :run
+if /I "%TARGET%"=="opencode" goto :run
+if /I "%TARGET%"=="gemini" goto :run
+if /I "%TARGET%"=="qwen" goto :run
+if /I "%TARGET%"=="goose" goto :run
+if /I "%TARGET%"=="cline" goto :run
+if /I "%TARGET%"=="roo" goto :run
+if /I "%TARGET%"=="json" goto :run
+goto :usage
+
+:run
+shift
+set "WORK="
+set "NO="
+set "FORCE="
+set "DRY="
+:parse
+if "%~1"=="" goto :parsed
+if /I "%~1"=="--no-launch" (
+    set "NO=-NoLaunch"
+    shift
+    goto :parse
+)
+if /I "%~1"=="--force" (
+    set "FORCE=-Force"
+    shift
+    goto :parse
+)
+if /I "%~1"=="--dry-run" (
+    set "DRY=-DryRun"
+    shift
+    goto :parse
+)
+if /I "%~1"=="--help" goto :usage
+if /I "%~1"=="-h" goto :usage
+set "ARG=%~1"
+if "%ARG:~0,2%"=="--" goto :usage
+if defined WORK goto :usage
+set "WORK=%~1"
+shift
+goto :parse
+
+:parsed
+if not defined WORK (
+    set "WORK=%CD%"
+    set /p "WORK=Target working folder [%CD%]: "
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%restore.ps1" -Target "%TARGET%" -Cwd "%WORK%" %NO% %FORCE% %DRY%
+set "RC=%ERRORLEVEL%"
+echo.
+if not "%RC%"=="0" echo Restore failed with exit code %RC%.
+exit /b %RC%
+
+:menu
+echo Restore this session into:
+echo   1. Claude Code
+echo   2. Codex
+echo   3. OpenCode
+echo   4. DeepSeek CLI
+echo   5. Qwen Code
+echo   6. Goose
+echo   7. Cline (VS Code)
+echo   8. Roo Code (VS Code)
+echo   9. Generic JSON / Markdown (any other AI tool)
+echo.
+set "TARGET="
+set "SEL="
+set /p "SEL=Select [1-9]: "
+if not defined SEL (
+    echo.
+    echo Cancelled.
+    exit /b 2
+)
+if "%SEL%"=="1" set "TARGET=claude"
+if "%SEL%"=="2" set "TARGET=codex"
+if "%SEL%"=="3" set "TARGET=opencode"
+if "%SEL%"=="4" set "TARGET=gemini"
+if "%SEL%"=="5" set "TARGET=qwen"
+if "%SEL%"=="6" set "TARGET=goose"
+if "%SEL%"=="7" set "TARGET=cline"
+if "%SEL%"=="8" set "TARGET=roo"
+if "%SEL%"=="9" set "TARGET=json"
+if not defined TARGET (
+    echo Invalid selection.
+    exit /b 2
+)
+set "WORK=%CD%"
+set /p "WORK=Target working folder [%CD%]: "
+powershell -NoProfile -ExecutionPolicy Bypass -File "%HERE%restore.ps1" -Target "%TARGET%" -Cwd "%WORK%"
+set "RC=%ERRORLEVEL%"
+echo.
+if not "%RC%"=="0" echo Restore failed with exit code %RC%.
+pause
+exit /b %RC%
+
+:usage
+echo usage: restore.bat claude^|codex^|opencode^|gemini^|qwen^|goose^|cline^|roo^|json ["working folder"] [--no-launch] [--force] [--dry-run]
+echo        restore.bat            (interactive menu)
+exit /b 2
+'''
+
+
+RESTORE_SH = r'''#!/bin/sh
+# Restore this session into another AI tool and continue it.
+# Usage:
+#   sh restore.sh claude|codex|opencode|gemini|qwen|goose|cline|roo|json [WORKDIR] [--no-launch] [--force] [--dry-run]
+#   sh restore.sh                     (interactive menu)
+set -u
+
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+TARGET="${1:-}"
+
+if [ -z "$TARGET" ]; then
+    echo "Restore this session into:"
+    echo "  1. Claude Code"
+    echo "  2. Codex"
+    echo "  3. OpenCode"
+    echo "  4. DeepSeek CLI"
+    echo "  5. Qwen Code"
+    echo "  6. Goose"
+    echo "  7. Cline (VS Code)"
+    echo "  8. Roo Code (VS Code)"
+    echo "  9. Generic JSON / Markdown (any other AI tool)"
+    printf "Select [1-9]: "
+    if ! read -r SEL; then exit 2; fi
+    case "$SEL" in
+        1) TARGET=claude ;;
+        2) TARGET=codex ;;
+        3) TARGET=opencode ;;
+        4) TARGET=gemini ;;
+        5) TARGET=qwen ;;
+        6) TARGET=goose ;;
+        7) TARGET=cline ;;
+        8) TARGET=roo ;;
+        9) TARGET=json ;;
+        *) echo "invalid selection" >&2; exit 2 ;;
+    esac
+else
+    shift
+fi
+
+usage() {
+    echo "usage: sh restore.sh claude|codex|opencode|gemini|qwen|goose|cline|roo|json [WORKDIR] [--no-launch] [--force] [--dry-run]" >&2
+}
+
+case "$TARGET" in
+    claude|codex|opencode|gemini|qwen|goose|cline|roo|json) ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 2 ;;
+esac
+
+CWD="$PWD"
+NO=0
+FORCE=0
+DRY=0
+SEEN=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-launch) NO=1 ;;
+        --force) FORCE=1 ;;
+        --dry-run) DRY=1 ;;
+        -h|--help) usage; exit 0 ;;
+        --*) echo "unknown option: $arg" >&2; exit 2 ;;
+        *)
+            if [ "$SEEN" = 1 ]; then
+                echo "only one working folder is allowed" >&2
+                exit 2
+            fi
+            CWD="$arg"
+            SEEN=1
+            ;;
+    esac
+done
+
+if [ -z "$CWD" ]; then
+    echo "invalid working folder" >&2
+    exit 2
+fi
+mkdir -p "$CWD" || exit 1
+CONV_ARGS=""
+[ "$FORCE" = 1 ] && CONV_ARGS="$CONV_ARGS --force"
+[ "$DRY" = 1 ] && CONV_ARGS="$CONV_ARGS --dry-run"
+# shellcheck disable=SC2086
+sh "$HERE/convert.sh" "$TARGET" "$CWD" $CONV_ARGS || exit $?
+
+if [ "$TARGET" = "json" ]; then exit 0; fi
+if [ "$DRY" = 1 ]; then exit 0; fi
+
+tp_id() {
+    sed -n "/\"$1\"[[:space:]]*:/,/}/p" "$HERE/metadata.json" 2>/dev/null \
+        | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | head -n 1
+}
+SID=$(tp_id "$TARGET")
+if [ -z "$SID" ]; then
+    echo "warning: could not read the new session id from metadata.json" >&2
+    exit 1
+fi
+
+echo ""
+echo "Session id: $SID"
+echo "Working folder: $CWD"
+case "$TARGET" in
+    claude) CMD="claude --resume \"$SID\"" ;;
+    codex) CMD="codex resume \"$SID\"" ;;
+    opencode) CMD="opencode --session \"$SID\"" ;;
+    gemini) CMD="gemini --resume \"$SID\"" ;;
+    qwen) CMD="qwen --resume \"$SID\"" ;;
+    goose) CMD="goose session --resume --name \"$SID\"" ;;
+    cline) CMD="open VS Code -> Cline -> History" ;;
+    roo) CMD="open VS Code -> Roo Code -> History" ;;
+esac
+echo "Resume with: $CMD"
+if [ "$NO" = 1 ]; then exit 0; fi
+case "$TARGET" in
+    cline|roo)
+        echo "The transcript is installed; open the extension history list to continue."
+        exit 0
+        ;;
+esac
+
+case "$TARGET" in
+    claude) TOOL=claude ;;
+    codex) TOOL=codex ;;
+    opencode) TOOL=opencode ;;
+    gemini) TOOL=gemini ;;
+    qwen) TOOL=qwen ;;
+    goose) TOOL=goose ;;
+esac
+if ! command -v "$TOOL" >/dev/null 2>&1; then
+    echo "warning: $TOOL is not on PATH; run the command above manually" >&2
+    exit 1
+fi
+
+cd "$CWD" || exit 1
+case "$TARGET" in
+    claude) exec claude --resume "$SID" ;;
+    codex) exec codex resume "$SID" ;;
+    opencode) exec opencode --session "$SID" ;;
+    gemini) exec gemini --resume "$SID" ;;
+    qwen) exec qwen --resume "$SID" ;;
+    goose) exec goose session --resume --name "$SID" ;;
+esac
+'''
+
+
+RESTORE_TARGET_BAT = r'''@echo off
+rem Restore this session into __LABEL__ and continue it.
+rem Usage: restore-__TARGET__.bat ["working folder"] [--no-launch] [--force] [--dry-run]
+setlocal
+call "%~dp0restore.bat" __TARGET__ %*
+set "RC=%ERRORLEVEL%"
+rem Pause only when double-clicked (cmdcmdline contains this script name).
+echo "%cmdcmdline%" | find /I "%~nx0" >nul
+if not errorlevel 1 pause
+exit /b %RC%
+'''
+
+
+RESTORE_TARGET_PS1 = r'''# Restore this session into __LABEL__ and continue it.
+# Usage:
+#   powershell -ExecutionPolicy Bypass -File restore-__TARGET__.ps1
+#       ["WORKDIR"] [-NoLaunch] [-Force] [-DryRun]
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0)][string]$Cwd = "",
+    [switch]$NoLaunch,
+    [switch]$Force,
+    [switch]$DryRun
+)
+$Here = $PSScriptRoot
+if (-not $Here) { $Here = Split-Path -Parent $MyInvocation.MyCommand.Path }
+& (Join-Path $Here "restore.ps1") -Target __TARGET__ -Cwd $Cwd `
+    -NoLaunch:$NoLaunch -Force:$Force -DryRun:$DryRun
+'''
+
+
+RESTORE_TARGET_SH = r'''#!/bin/sh
+# Restore this session into __LABEL__ and continue it.
+# Usage: sh restore-__TARGET__.sh ["WORKDIR"] [--no-launch] [--force] [--dry-run]
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+exec sh "$HERE/restore.sh" __TARGET__ "$@"
 '''

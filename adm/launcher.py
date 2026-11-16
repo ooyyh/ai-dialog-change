@@ -34,8 +34,13 @@ def open_terminal(command: str, cwd: str) -> None:
             cwd=cwd, shell=False)
 
 
-def resume(meta: SessionMeta) -> None:
-    if meta.source == "claude":
-        open_terminal(f"claude --resume {meta.id}", meta.cwd)
-    else:
-        open_terminal(f"codex resume {meta.id}", meta.cwd)
+def resume(meta: SessionMeta) -> bool:
+    """Open the source CLI on this session; False for GUI-only stores."""
+    from . import sources
+    cmd = sources.resume_command(meta)
+    if not cmd:
+        return False
+    if meta.source in ("gemini", "qwen") and not meta.cwd:
+        return False
+    open_terminal(cmd, meta.cwd or str(Path.home()))
+    return True

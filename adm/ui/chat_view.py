@@ -105,9 +105,10 @@ class MessageFrame(QFrame):
     check_toggled = pyqtSignal(int, bool)    # line, checked
 
     def __init__(self, msg: Message, checkable: bool = False,
-                 checked: bool = False):
+                 checked: bool = False, read_only: bool = False):
         super().__init__()
         self.msg = msg
+        self.read_only = read_only
         self.setProperty("msgframe", True)
         self.setStyleSheet(f"QFrame[msgframe='true'] {{ border-left: 3px solid "
                            f"{theme.ROLE_COLORS.get(msg.role, theme.DIM)}; }}")
@@ -178,7 +179,7 @@ class MessageFrame(QFrame):
         self.setToolTip(util.one_line(msg.plain_text(300), 400) or msg.role)
 
     def mouseDoubleClickEvent(self, ev) -> None:
-        if ev.button() == Qt.MouseButton.LeftButton:
+        if not self.read_only and ev.button() == Qt.MouseButton.LeftButton:
             self.edit_requested.emit(self.msg)
         super().mouseDoubleClickEvent(ev)
 
@@ -192,16 +193,18 @@ class MessageFrame(QFrame):
         from PyQt6.QtGui import QAction
         from PyQt6.QtWidgets import QApplication, QMenu
         menu = QMenu(self)
-        a = QAction(tr("ctx_edit"), self)
-        a.triggered.connect(lambda: self.edit_requested.emit(self.msg))
-        menu.addAction(a)
+        if not self.read_only:
+            a = QAction(tr("ctx_edit"), self)
+            a.triggered.connect(lambda: self.edit_requested.emit(self.msg))
+            menu.addAction(a)
         a2 = QAction(tr("ctx_copy"), self)
         a2.triggered.connect(
             lambda: QApplication.clipboard().setText(self.msg.plain_text(200000)))
         menu.addAction(a2)
-        a3 = QAction(tr("ctx_delmsg"), self)
-        a3.triggered.connect(lambda: self.delete_requested.emit(self.msg))
-        menu.addAction(a3)
+        if not self.read_only:
+            a3 = QAction(tr("ctx_delmsg"), self)
+            a3.triggered.connect(lambda: self.delete_requested.emit(self.msg))
+            menu.addAction(a3)
         menu.exec(self.mapToGlobal(pos))
 
 
@@ -224,6 +227,7 @@ class ChatView(QWidget):
         self._batch = False
         self._checked: set[int] = set()
         self._reverse = False
+        self.read_only = False
         self._build()
 
     def _build(self) -> None:
@@ -332,6 +336,11 @@ class ChatView(QWidget):
     # -- session ---------------------------------------------------------
     def set_session(self, session: LoadedSession | None) -> None:
         self.session = session
+        self.read_only = bool(session and not session.meta.editable)
+        if self.read_only and self._batch:
+            self._set_batch(False)
+            self.batch_btn.setChecked(False)
+        self.batch_btn.setEnabled(not self.read_only)
         self._checked.clear()
         self._update_sel_lbl()
         self._refilter()
@@ -395,7 +404,8 @@ class ChatView(QWidget):
         stretch = self.vbox.takeAt(self.vbox.count() - 1)
         for m in chunk:
             f = MessageFrame(m, checkable=self._batch,
-                             checked=m.line in self._checked)
+                             checked=m.line in self._checked,
+                             read_only=self.read_only)
             f.edit_requested.connect(self._relay_edit)
             f.delete_requested.connect(self._relay_delete)
             f.check_toggled.connect(self._on_check)
@@ -439,6 +449,9 @@ class ChatView(QWidget):
 
     # -- batch selection ----------------------------------------------------
     def _set_batch(self, on: bool) -> None:
+        if on and self.read_only:
+            self.batch_btn.setChecked(False)
+            return
         self._batch = on
         if not on:
             self._checked.clear()
@@ -461,8 +474,9 @@ class ChatView(QWidget):
     def _update_sel_lbl(self) -> None:
         n = len(self._checked)
         self.sel_lbl.setText(tr("sel_n", n=n))
-        for b in (self.copy_btn, self.export_btn, self.del_btn):
+        for b in (self.copy_btn, self.export_btn):
             b.setEnabled(n > 0)
+        self.del_btn.setEnabled(n > 0 and not self.read_only)
         self.all_btn.setEnabled(bool(self._visible))
 
     def _select_visible(self) -> None:
@@ -525,6 +539,8 @@ class ChatView(QWidget):
         self.status_message.emit(tr("msg_exported", n=len(msgs), path=path))
 
     def _delete_selection(self) -> None:
+        if self.read_only:
+            return
         msgs = self._selected_msgs()
         if msgs:
             self.delete_batch_requested.emit(msgs)

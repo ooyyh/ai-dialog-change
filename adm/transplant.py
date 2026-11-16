@@ -7,6 +7,11 @@ then writes it into the session store of a chosen target:
 * ``claude``    ~/.claude/projects/<munged cwd>/<new uuid>.jsonl
 * ``codex``     ~/.codex/sessions/YYYY/MM/DD/rollout-*-<uuid7>.jsonl + state DB
 * ``opencode``  OpenCode V2 (2.x) via its local HTTP import API
+* ``gemini``    ~/.gemini/tmp/<sha256(cwd)>/chats/session-*.json (DeepSeek CLI)
+* ``qwen``      ~/.qwen/tmp/<sha256(cwd)>/chats/session-*.json (Qwen Code)
+* ``goose``     ~/.local/share/goose/sessions/<id>.json
+* ``cline``     VS Code globalStorage/.../saoudrizwan.claude-dev/tasks/<id>/
+* ``roo``       VS Code globalStorage/.../rooveterinaryinc.roo-cline/tasks/<id>/
 * ``json``      portable transcript.json + transcript.md for any other tool
 
 Tool calls/results and (optionally) reasoning are flattened to readable text
@@ -20,12 +25,14 @@ with a fresh id and the requested working directory.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -37,7 +44,8 @@ from pathlib import Path
 from . import claude_store, codex_store, config, util
 from .models import LoadedSession, Message, SessionMeta
 
-TARGETS = ("claude", "codex", "opencode", "json")
+TARGETS = ("claude", "codex", "opencode", "gemini", "qwen", "goose",
+           "cline", "roo", "json")
 
 # Written into pre-rendered transcripts of an upload bundle. Installers
 # replace it with the target working folder at install time. Alphanumeric +
@@ -94,6 +102,14 @@ class TransplantResult:
             return f'cd "{self.cwd}" && codex   ->  /resume'
         if self.target == "opencode":
             return f'cd "{self.cwd}" && opencode   (pick "{self.title}")'
+        if self.target in ("gemini", "qwen"):
+            return f'cd "{self.cwd}" && {self.target} --resume {self.session_id}'
+        if self.target == "goose":
+            return (f'cd "{self.cwd}" && goose session --resume '
+                    f'--name {self.session_id}')
+        if self.target in ("cline", "roo"):
+            label = "Cline" if self.target == "cline" else "Roo Code"
+            return f"open VS Code -> {label} -> History ({self.path})"
         return f"portable transcript: {self.path}"
 
 
@@ -135,35 +151,68 @@ def _clean_api_errors(msg: Message) -> bool:
 
 def build_transcript(messages: list[Message],
                      options: TransplantOptions | None = None) -> list[NeutralMessage]:
-    """Turn a parsed Claude/Codex message stream into clean user/assistant turns."""
+    """Turn a parsed source stream into granular user/assistant turns.
+
+    Do **not** merge adjacent assistant messages into one giant block.  A long
+    agent run has text, thinking, tool calls and tool results interleaved;
+    each becomes its own neutral message so target tools render separate
+    bubbles instead of one multi-hundred-KB wall of text.
+    """
     opt = options or TransplantOptions()
     out: list[NeutralMessage] = []
-    pending_reasoning: list[str] = []
 
-    def push(role: str, text: str, ts) -> None:
+    def emit(role: str, text: str, ts) -> None:
         text = (text or "").strip()
-        if not text:
-            return
-        if out and out[-1].role == role:
-            out[-1].text = out[-1].text.rstrip() + "\n\n" + text
-            if out[-1].ts is None:
-                out[-1].ts = ts
-        else:
+        if text:
             out.append(NeutralMessage(role=role, text=text, ts=ts))
-
-    def attach_tool(text: str, ts) -> None:
-        # tool traffic belongs to the assistant turn that triggered it
-        if out and out[-1].role == "assistant":
-            out[-1].text = out[-1].text.rstrip() + "\n\n" + text
-            if out[-1].ts is None:
-                out[-1].ts = ts
-        else:
-            push("assistant", text, ts)
 
     def prefix_reasoning(text: str) -> str:
         if not text.strip():
             return ""
         return "[thinking]\n" + text.strip()
+
+    def assistant_chunks(m: Message) -> list[str]:
+        """Split one source assistant record into readable chunks.
+
+        A tool call and its matching result stay together in one chunk;
+        unrelated text/thinking/tool traffic becomes separate messages.
+        """
+        chunks: list[str] = []
+        pending: list[str] | None = None   # [text, call_id]
+        for p in m.parts:
+            kind = p.kind
+            if kind == "text" and (p.text or "").strip():
+                if pending:
+                    chunks.append(pending[0])
+                    pending = None
+                chunks.append(p.text.strip())
+            elif kind in ("thinking", "reasoning"):
+                if not opt.include_reasoning or not (p.text or "").strip():
+                    continue
+                if pending:
+                    chunks.append(pending[0])
+                    pending = None
+                chunks.append(prefix_reasoning(p.text))
+            elif kind == "tool_call" and opt.include_tools:
+                if pending:
+                    chunks.append(pending[0])
+                pending = [_tool_call_text(m, p, opt.tool_arg_limit),
+                           p.tool_id or ""]
+            elif kind == "tool_result" and opt.include_tools:
+                result = _tool_result_text(p, opt.tool_result_limit)
+                if pending and (not p.tool_id or not pending[1]
+                                or p.tool_id == pending[1]):
+                    pending[0] = pending[0].rstrip() + "\n\n" + result
+                    chunks.append(pending[0])
+                    pending = None
+                else:
+                    if pending:
+                        chunks.append(pending[0])
+                        pending = None
+                    chunks.append(result)
+        if pending:
+            chunks.append(pending[0])
+        return chunks
 
     for m in messages:
         if m.sidechain and not opt.include_sidechain:
@@ -171,69 +220,51 @@ def build_transcript(messages: list[Message],
         if m.role == "system" or _clean_api_errors(m):
             continue
         sc_prefix = "[subagent]\n" if m.sidechain else ""
-        texts = [p.text for p in m.parts if p.kind == "text" and (p.text or "").strip()]
+        texts = [p.text for p in m.parts
+                 if p.kind == "text" and (p.text or "").strip()]
         thinking = [p.text for p in m.parts
                     if p.kind in ("thinking", "reasoning") and (p.text or "").strip()]
-        calls = [p for p in m.parts if p.kind == "tool_call"]
         results = [p for p in m.parts if p.kind == "tool_result"]
+        calls = [p for p in m.parts if p.kind == "tool_call"]
 
         if m.role == "user":
-            if results and opt.include_tools:  # claude tool_result record
+            if results and opt.include_tools:  # Claude tool_result record
                 for p in results:
-                    attach_tool(_tool_result_text(p, opt.tool_result_limit), m.ts)
+                    emit("assistant",
+                         sc_prefix + _tool_result_text(p, opt.tool_result_limit),
+                         m.ts)
             text = "\n\n".join(texts)
-            if not text or _is_injection(text):
-                continue
-            if pending_reasoning:
-                push("assistant", "\n\n".join(pending_reasoning), None)
-                pending_reasoning = []
-            push("user", sc_prefix + text, m.ts)
+            if text and not _is_injection(text):
+                emit("user", sc_prefix + text, m.ts)
             continue
 
         if m.role == "assistant":
-            chunks: list[str] = []
-            for p in m.parts:
-                if p.kind == "text" and (p.text or "").strip():
-                    chunks.append(p.text)
-                elif p.kind in ("thinking", "reasoning") and opt.include_reasoning \
-                        and (p.text or "").strip():
-                    chunks.append(prefix_reasoning(p.text))
-                elif p.kind == "tool_call" and opt.include_tools:
-                    chunks.append(_tool_call_text(m, p, opt.tool_arg_limit))
-                elif p.kind == "tool_result" and opt.include_tools:
-                    chunks.append(_tool_result_text(p, opt.tool_result_limit))
-            if pending_reasoning:
-                chunks.insert(0, "\n\n".join(pending_reasoning))
-                pending_reasoning = []
-            text = "\n\n".join(chunks)
-            if text:
-                push("assistant", sc_prefix + text, m.ts)
+            for chunk in assistant_chunks(m):
+                emit("assistant", sc_prefix + chunk, m.ts)
             continue
 
         if m.role == "reasoning":
             if opt.include_reasoning and thinking:
-                block = prefix_reasoning("\n".join(thinking))
-                if out and out[-1].role == "assistant" and \
-                        out[-1].text.startswith("[thinking]"):
-                    out[-1].text += "\n\n" + block
-                else:
-                    pending_reasoning.append(block)
+                emit("assistant", sc_prefix + prefix_reasoning("\n".join(thinking)),
+                     m.ts)
             continue
 
         if m.role == "tool_result":
             if opt.include_tools:
                 for p in results:
-                    attach_tool(sc_prefix + _tool_result_text(p, opt.tool_result_limit), m.ts)
+                    emit("assistant",
+                         sc_prefix + _tool_result_text(p, opt.tool_result_limit),
+                         m.ts)
             continue
 
         if m.role == "tool_call":
             if opt.include_tools:
                 for p in calls:
-                    attach_tool(sc_prefix + _tool_call_text(m, p, opt.tool_arg_limit), m.ts)
+                    emit("assistant",
+                         sc_prefix + _tool_call_text(m, p, opt.tool_arg_limit),
+                         m.ts)
             continue
 
-    if not out and pending_reasoning:
-        push("assistant", "\n\n".join(pending_reasoning), None)
     return out
 
 
@@ -334,11 +365,8 @@ def _ensure_cwd(cwd: str) -> str:
 # ---------------------------------------------------------------- loaders
 
 def load_source(meta: SessionMeta) -> LoadedSession:
-    if meta.source == "claude":
-        return claude_store.load_claude(meta)
-    if meta.source == "codex":
-        return codex_store.load_codex(meta)
-    raise TransplantError(f"unsupported source: {meta.source}")
+    from . import sources
+    return sources.load_session(meta)
 
 
 def _meta_from_file(path: Path) -> SessionMeta:
@@ -369,10 +397,13 @@ def _meta_from_file(path: Path) -> SessionMeta:
 
 
 def find_session(source: str) -> SessionMeta:
-    """Resolve a session id / id prefix to a scanned Claude or Codex session."""
-    cl = claude_store.scan_claude()
-    cx = codex_store.scan_codex()
-    hits = [m for m in cl + cx
+    """Resolve a session id / id prefix across every supported source."""
+    from . import sources
+    from .scan_cache import ScanCache
+    cache = ScanCache()
+    metas = sources.scan_all(cache=cache)
+    cache.save()
+    hits = [m for m in metas
             if m.id == source or m.id.lower().startswith(source.lower())]
     if not hits:
         raise TransplantError(f"session not found: {source}")
@@ -401,6 +432,14 @@ def write_transcript(messages: list[NeutralMessage], title: str, cwd: str,
         return _write_codex(messages, title, cwd, model=model)
     if target == "opencode":
         return _write_opencode(messages, title, cwd)
+    if target in ("gemini", "qwen"):
+        default = "gemini-2.5-pro" if target == "gemini" else "qwen3-coder-plus"
+        return _write_gemini(messages, title, cwd, tool=target,
+                             model=model or default)
+    if target == "goose":
+        return _write_goose(messages, title, cwd)
+    if target in ("cline", "roo"):
+        return _write_cline(messages, title, cwd, tool=target)
     return _write_generic(messages, title, cwd, source, source_name,
                           Path(out_dir) if out_dir else Path(cwd))
 
@@ -813,6 +852,193 @@ def _write_opencode(messages: list[NeutralMessage], title: str,
         path=(info.get("location") or {}).get("directory") or cwd,
         n_messages=len(messages),
         detail=f"projectID={info.get('projectID', '')}")
+
+
+# -- Gemini CLI / Qwen Code ------------------------------------------------
+
+def _project_hash(cwd: str) -> str:
+    """DeepSeek CLI / DeepSeek Code project key: sha256(cwd) hex."""
+    return hashlib.sha256(cwd.encode("utf-8")).hexdigest()
+
+
+def build_gemini_session(messages: list[NeutralMessage], title: str, cwd: str,
+                         *, model: str = "", sid: str | None = None,
+                         project_hash: str | None = None) -> dict:
+    """Session JSON as written by DeepSeek CLI's ChatRecordingService."""
+    sid = sid or str(uuidlib.uuid4())
+    records: list[dict] = []
+    for m in messages:
+        ts = _iso(m.ts)
+        if m.role == "user":
+            records.append({
+                "id": str(uuidlib.uuid4()), "timestamp": ts,
+                "type": "user", "content": m.text,
+            })
+        else:
+            records.append({
+                "id": str(uuidlib.uuid4()), "timestamp": ts,
+                "type": "gemini", "content": m.text,
+                "model": model or "gemini-2.5-pro",
+                "tokens": {"input": 0, "output": 0, "cached": 0,
+                           "thoughts": 0, "tool": 0, "total": 0},
+            })
+    start = _iso(messages[0].ts) if messages else _now_iso()
+    return {
+        "sessionId": sid,
+        "projectHash": project_hash or _project_hash(cwd),
+        "startTime": start,
+        "lastUpdated": _now_iso(),
+        "messages": records,
+    }
+
+
+def _gemini_home(tool: str) -> Path:
+    env = os.environ.get("GEMINI_CLI_HOME" if tool == "gemini"
+                         else "QWEN_HOME")
+    return Path(env).expanduser() if env else Path.home() / f".{tool}"
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+
+
+def _write_gemini(messages: list[NeutralMessage], title: str, cwd: str,
+                  *, tool: str, model: str) -> TransplantResult:
+    sid = str(uuidlib.uuid4())
+    doc = build_gemini_session(messages, title, cwd, model=model, sid=sid)
+    dest = (_gemini_home(tool) / "tmp" / doc["projectHash"] / "chats"
+            / f"session-{_utc_stamp()}-{sid}.json")
+    _atomic_write(dest, json.dumps(doc, ensure_ascii=False, indent=2) + "\n")
+    return TransplantResult(target=tool, session_id=sid, title=title, cwd=cwd,
+                            path=str(dest), n_messages=len(messages))
+
+
+# -- Goose -----------------------------------------------------------------
+
+def build_goose_session(messages: list[NeutralMessage], title: str, cwd: str,
+                        *, sid: str | None = None) -> dict:
+    """Session JSON as stored in ~/.local/share/goose/sessions/<id>.json."""
+    sid = sid or datetime.now().strftime("%Y%m%d_%H%M%S")
+    out: list[dict] = []
+    for m in messages:
+        ts = m.ts if m.ts is not None else datetime.now(timezone.utc)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        out.append({
+            "role": "user" if m.role == "user" else "assistant",
+            "created": int(ts.timestamp()),
+            "content": [{"type": "text", "text": m.text}],
+        })
+    return {
+        "id": sid,
+        "description": title,
+        "working_dir": cwd,
+        "extension_data": {},
+        "conversation": {"messages": out},
+        "message_count": len(out),
+        "created_at": _iso(messages[0].ts) if messages else _now_iso(),
+        "updated_at": _now_iso(),
+    }
+
+
+def _goose_home() -> Path:
+    env = os.environ.get("GOOSE_HOME")
+    if env:
+        return Path(env).expanduser()
+    if os.name == "nt":
+        appdata = Path(os.environ.get("APPDATA")
+                       or Path.home() / "AppData" / "Roaming")
+        cands = [appdata / "Block" / "goose" / "data" / "sessions",
+                 appdata / "goose" / "data" / "sessions",
+                 appdata / "Block" / "goose" / "sessions",
+                 appdata / "goose" / "sessions"]
+        for c in cands:
+            if c.exists() or c.parent.exists():
+                return c
+        return cands[0]
+    base = Path(os.environ.get("XDG_DATA_HOME")
+                or Path.home() / ".local" / "share")
+    return base / "goose" / "sessions"
+
+
+def _write_goose(messages: list[NeutralMessage], title: str, cwd: str
+                 ) -> TransplantResult:
+    doc = build_goose_session(messages, title, cwd)
+    dest = _goose_home() / f"{doc['id']}.json"
+    _atomic_write(dest, json.dumps(doc, ensure_ascii=False, indent=2) + "\n")
+    return TransplantResult(target="goose", session_id=doc["id"], title=title,
+                            cwd=cwd, path=str(dest), n_messages=len(messages))
+
+
+# -- Cline / Roo Code (VS Code extensions) ---------------------------------
+
+def build_cline_task(messages: list[NeutralMessage], title: str, cwd: str,
+                     *, sid: str | None = None
+                     ) -> tuple[str, list[dict], list[dict], dict]:
+    """(task_id, api_conversation_history, ui_messages, task_metadata)."""
+    sid = sid or str(int(time.time() * 1000))
+    history: list[dict] = []
+    ui: list[dict] = []
+    first_user = True
+    for idx, m in enumerate(messages):
+        ts = _ms(m.ts)
+        if m.role == "user":
+            history.append({"role": "user", "ts": ts,
+                            "content": [{"type": "text", "text": m.text}]})
+            ui.append({"ts": ts, "type": "say",
+                       "say": "task" if first_user else "user_feedback",
+                       "text": m.text, "conversationHistoryIndex": idx})
+            first_user = False
+        else:
+            history.append({"role": "assistant", "ts": ts,
+                            "content": [{"type": "text", "text": m.text}]})
+            ui.append({"ts": ts, "type": "say", "say": "text",
+                       "text": m.text, "conversationHistoryIndex": idx})
+    meta = {"files_in_context": [], "model_usage": [],
+            "environment_history": []}
+    return sid, history, ui, meta
+
+
+def _vscode_global_storage() -> Path:
+    env = os.environ.get("ADM_VSCODE_GLOBAL_STORAGE")
+    if env:
+        return Path(env).expanduser()
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA")
+                    or Path.home() / "AppData" / "Roaming")
+        stable = base / "Code" / "User" / "globalStorage"
+        insiders = base / "Code - Insiders" / "User" / "globalStorage"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+        stable = base / "Code" / "User" / "globalStorage"
+        insiders = base / "Code - Insiders" / "User" / "globalStorage"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME")
+                    or Path.home() / ".config")
+        stable = base / "Code" / "User" / "globalStorage"
+        insiders = base / "Code - Insiders" / "User" / "globalStorage"
+    if not stable.exists() and insiders.exists():
+        return insiders
+    return stable
+
+
+def _cline_ext(tool: str) -> str:
+    return ("saoudrizwan.claude-dev" if tool == "cline"
+            else "rooveterinaryinc.roo-cline")
+
+
+def _write_cline(messages: list[NeutralMessage], title: str, cwd: str,
+                 *, tool: str) -> TransplantResult:
+    sid, history, ui, meta = build_cline_task(messages, title, cwd)
+    dest = _vscode_global_storage() / _cline_ext(tool) / "tasks" / sid
+    _atomic_write(dest / "api_conversation_history.json",
+                  json.dumps(history, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write(dest / "ui_messages.json",
+                  json.dumps(ui, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write(dest / "task_metadata.json",
+                  json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+    return TransplantResult(target=tool, session_id=sid, title=title, cwd=cwd,
+                            path=str(dest), n_messages=len(messages))
 
 
 # -- generic ---------------------------------------------------------------

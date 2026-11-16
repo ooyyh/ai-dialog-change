@@ -16,7 +16,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .. import claude_store, codex_store, launcher, local_store, transfer, transplant, util
+from .. import (claude_store, codex_store, launcher, local_store, sources,
+                transfer, transplant, util)
 from ..i18n import role_label, set_lang, tr
 from ..jsonlio import FileChangedError
 from ..models import LoadedSession, Message, SessionMeta
@@ -65,10 +66,7 @@ class LoadThread(QThread):
 
     def run(self) -> None:
         try:
-            if self.meta.source == "claude":
-                sess = claude_store.load_claude(self.meta)
-            else:
-                sess = codex_store.load_codex(self.meta)
+            sess = sources.load_session(self.meta)
         except Exception:  # noqa: BLE001
             traceback.print_exc()
             sess = None
@@ -320,11 +318,13 @@ class MainWindow(QMainWindow):
 
     def _fill_source_combo(self) -> None:
         cur = self.source_combo.currentData() if hasattr(self, "source_combo") else "All"
+        present = {m.source for m in getattr(self, "metas", [])}
         self.source_combo.blockSignals(True)
         self.source_combo.clear()
         self.source_combo.addItem(tr("all"), "All")
-        self.source_combo.addItem("Claude", "Claude")
-        self.source_combo.addItem("Codex", "Codex")
+        for info in sources.ordered():
+            if info.id in ("claude", "codex") or info.id in present:
+                self.source_combo.addItem(info.badge, info.badge)
         ix = self.source_combo.findData(cur)
         self.source_combo.setCurrentIndex(max(0, ix))
         self.source_combo.blockSignals(False)
@@ -398,13 +398,21 @@ class MainWindow(QMainWindow):
             self.project_combo.setCurrentIndex(max(0, ix))
         self.project_combo.blockSignals(False)
         self.model.set_rows(metas)
-        n_claude = sum(1 for m in metas if m.source == "claude")
-        self.status_lbl.setText(tr("status_sessions", n=len(metas), c=n_claude,
-                                   x=len(metas) - n_claude))
+        self._fill_source_combo()
+        counts: dict[str, int] = {}
+        for m in metas:
+            counts[m.source] = counts.get(m.source, 0) + 1
+        detail = " · ".join(
+            f"{sources.badge(k)} {v}"
+            for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+        self.status_lbl.setText(tr("status_sessions_multi", n=len(metas),
+                                   counts=detail))
         self._install_watcher()
 
     def _install_watcher(self) -> None:
         from .. import config as cfg
+        from .. import (cline_store, gemini_store, goose_store, junie_store,
+                        pi_store)
         dirs = set()
         # New session files land inside a project dir (claude) or a YYYY/MM/DD
         # day dir (codex). QFileSystemWatcher does NOT report changes in
@@ -422,6 +430,25 @@ class MainWindow(QMainWindow):
                     for sub2 in sub.iterdir():
                         if sub2.is_dir():
                             dirs.add(str(sub2))
+        # OpenCode/Qoder live in a frequently-written SQLite DB; watching the
+        # WAL directory would trigger a rescan on every token.  Refresh those
+        # stores on F5 / startup instead.
+        extra: list[Path | None] = [
+            junie_store.sessions_dir(),
+            pi_store.sessions_dir(),
+            gemini_store.home("gemini") / "tmp",
+            gemini_store.home("qwen") / "tmp",
+            goose_store.sessions_dir(),
+        ]
+        for p in extra:
+            if p is None:
+                continue
+            d = p.parent if p.is_file() else p
+            if d.is_dir():
+                dirs.add(str(d))
+        for tool in ("cline", "roo"):
+            for p in cline_store.task_roots(tool):
+                dirs.add(str(p))
         if self._watcher is not None:
             self._watcher.removePaths(self._watcher.directories())
         else:
@@ -535,8 +562,7 @@ class MainWindow(QMainWindow):
                                       util.fmt_size(m.size),
                                       util.fmt_dt(m.updated or m.created)])
                 it.setData(0, Qt.ItemDataRole.UserRole, m)
-                it.setForeground(1, QColor("#5b8cff" if m.source == "claude"
-                                           else "#4ec9a8"))
+                it.setForeground(1, QColor(sources.color(m.source)))
                 if m.archived:
                     for c in range(5):
                         it.setForeground(c, QColor("#777d8c"))
@@ -617,7 +643,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         for key, slot in [
             ("ctx_open", lambda: self._load_selected(meta=m)),
-            ("ctx_resume", lambda: launcher.resume(m)),
+            ("ctx_resume", lambda: self._resume_meta(m)),
             ("ctx_star", lambda: self.toggle_star()),
             ("ctx_rename", lambda: self.rename_selected()),
             ("ctx_note", lambda: self.set_note()),
@@ -631,6 +657,14 @@ class MainWindow(QMainWindow):
             a.triggered.connect(slot)
             menu.addAction(a)
         menu.exec(gp)
+
+    def _readonly(self, m: SessionMeta, key: str = "readonly_body") -> None:
+        QMessageBox.information(self, tr("readonly_title"),
+                                tr(key, source=m.source_badge))
+
+    def _resume_meta(self, m: SessionMeta) -> None:
+        if not launcher.resume(m):
+            self._readonly(m, "readonly_resume")
 
     def _reveal_file(self, m: SessionMeta) -> None:
         import subprocess
@@ -666,9 +700,11 @@ class MainWindow(QMainWindow):
     def _loaded(self, sess) -> None:
         if sess is None:
             self.sub_lbl.setText(tr("load_failed"))
+            self.addmsg_btn.setEnabled(False)
             return
         self.loaded = sess
         m = sess.meta
+        self.addmsg_btn.setEnabled(bool(m.editable))
         rec = local_store.get(m.source, m.id)
         m.starred = rec.get("starred", False)
         bits = tr("sub_info",
@@ -698,7 +734,7 @@ class MainWindow(QMainWindow):
     def resume_selected(self) -> None:
         m = self._selected() or (self.loaded.meta if self.loaded else None)
         if m:
-            launcher.resume(m)
+            self._resume_meta(m)
 
     def toggle_star(self) -> None:
         m = self._selected() or (self.loaded.meta if self.loaded else None)
@@ -728,6 +764,15 @@ class MainWindow(QMainWindow):
         if not ok or not text.strip():
             return
         title = text.strip()
+        if not m.editable:
+            local_store.update(m.source, m.id, custom_title=title)
+            m.custom_title = title
+            self.model.update_row(m)
+            self.title_lbl.setText(m.display_title)
+            if self.loaded and self.loaded.meta.source == m.source and \
+                    self.loaded.meta.id == m.id:
+                self.loaded.meta.custom_title = title
+            return
         try:
             if m.source == "claude":
                 from ..jsonlio import SessionEditor
@@ -757,8 +802,11 @@ class MainWindow(QMainWindow):
         if not m:
             return
         if m.source != "codex":
-            QMessageBox.information(self, tr("arch_claude_title"),
-                                    tr("arch_claude_body"))
+            if not m.editable:
+                self._readonly(m)
+            else:
+                QMessageBox.information(self, tr("arch_claude_title"),
+                                        tr("arch_claude_body"))
             return
         try:
             codex_store.set_archived(m.id, not m.archived)
@@ -772,6 +820,9 @@ class MainWindow(QMainWindow):
     def duplicate_selected(self) -> None:
         m = self._selected() or (self.loaded.meta if self.loaded else None)
         if not m:
+            return
+        if not m.editable:
+            self._readonly(m)
             return
         try:
             if m.source == "claude":
@@ -794,6 +845,10 @@ class MainWindow(QMainWindow):
         """Export selected sessions as portable, resumable bundles."""
         if not metas:
             QMessageBox.information(self, tr("app_title"), tr("b_none"))
+            return
+        blocked = [m for m in metas if m.source not in ("claude", "codex")]
+        if blocked:
+            self._readonly(blocked[0], "readonly_upload")
             return
         start = str(self.settings.value(
             "upload_dir", str(Path.home() / "Downloads")))
@@ -934,10 +989,7 @@ class MainWindow(QMainWindow):
             self.status_lbl.setText(f"{i + 1}/{len(metas)} {m.display_title[:40]}")
             QApplication.processEvents()
             try:
-                if m.source == "claude":
-                    sess = claude_store.load_claude(m)
-                else:
-                    sess = codex_store.load_codex(m)
+                sess = sources.load_session(m)
                 fname = f"{_safe_name(m.display_title)[:60]}-{m.id[:8]}.md"
                 export_markdown(sess, str(Path(d) / fname))
                 ok += 1
@@ -952,6 +1004,10 @@ class MainWindow(QMainWindow):
     def delete_selected(self) -> None:
         metas = self.selected_metas()
         if not metas:
+            return
+        blocked = [m for m in metas if not m.editable]
+        if blocked:
+            self._readonly(blocked[0])
             return
         total = sum(m.size for m in metas)
         if len(metas) == 1:
@@ -983,6 +1039,8 @@ class MainWindow(QMainWindow):
         """Backup + delete one session file (and its codex sqlite rows)."""
         from ..jsonlio import make_backup
         from .. import config as cfg
+        if not m.editable:
+            return False
         try:
             make_backup(m.path, m.source, m.id)
             Path(m.path).unlink(missing_ok=True)
@@ -1003,6 +1061,9 @@ class MainWindow(QMainWindow):
         if not self.loaded:
             return
         m = self.loaded.meta
+        if not m.editable:
+            self._readonly(m)
+            return
         if m.running and not _confirm(self, tr("run_title"), tr("run_body")):
             return
         dlg = MessageEditDialog(msg, self)
@@ -1044,6 +1105,9 @@ class MainWindow(QMainWindow):
         if not self.loaded or not msgs:
             return
         m = self.loaded.meta
+        if not m.editable:
+            self._readonly(m)
+            return
         store = claude_store if m.source == "claude" else codex_store
         linked: set[int] = set()
         for msg in msgs:
@@ -1097,6 +1161,9 @@ class MainWindow(QMainWindow):
         if not self.loaded:
             return
         m = self.loaded.meta
+        if not m.editable:
+            self._readonly(m)
+            return
         dlg = AddMessageDialog(self)
         if m.running:
             dlg.warn.setText(tr("add_warn"))

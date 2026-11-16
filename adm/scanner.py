@@ -1,10 +1,10 @@
-"""Background scan of all Claude + Codex sessions."""
+"""Background scan of every supported session source."""
 from __future__ import annotations
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from . import claude_store, codex_store, local_store
-from .models import SessionMeta
+from . import local_store, sources
+from .scan_cache import ScanCache
 
 
 class ScanThread(QThread):
@@ -12,16 +12,16 @@ class ScanThread(QThread):
     finished_scan = pyqtSignal(list)
 
     def run(self) -> None:
-        metas: list[SessionMeta] = []
+        metas = []
+        cache = ScanCache()
         try:
-            metas.extend(claude_store.scan_claude(self._prog))
-        except Exception as e:  # noqa: BLE001 — scanner must never kill the UI
-            self.progress.emit(f"claude scan error: {e}")
-        try:
-            metas.extend(codex_store.scan_codex(self._prog))
-        except Exception as e:  # noqa: BLE001
-            self.progress.emit(f"codex scan error: {e}")
+            metas = sources.scan_all(self._prog, cache)
+        except Exception as e:  # noqa: BLE001 — never kill the UI
+            self.progress.emit(f"scan error: {e}")
+        finally:
+            cache.save()
         local_store.apply_to(metas)
+
         def sort_key(m):
             dt = m.updated or m.created
             return dt.timestamp() if dt else 0.0

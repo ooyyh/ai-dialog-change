@@ -5,6 +5,7 @@ import json
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from . import sources
 from .models import SessionMeta
 
 MAX_HITS = 3000
@@ -36,6 +37,27 @@ class SearchThread(QThread):
             if self._cancel or n >= MAX_HITS or not q:
                 break
             self.status.emit(f"{k + 1}/{len(self.metas)} {m.display_title[:40]}")
+            if m.source not in ("claude", "codex"):
+                try:
+                    sess = sources.load_session(m)
+                except Exception:  # noqa: BLE001 — one bad store is non-fatal
+                    continue
+                for msg in sess.messages:
+                    text = "\n".join(p.text for p in msg.parts if p.text)
+                    if q not in text.lower():
+                        continue
+                    pos = text.lower().find(q)
+                    self.hit.emit({
+                        "meta": m, "line": msg.line, "role": msg.role,
+                        "text": text,
+                        "snippet": _snippet(text, max(0, pos)),
+                    })
+                    n += 1
+                    if n >= MAX_HITS:
+                        break
+                if n >= MAX_HITS:
+                    break
+                continue
             try:
                 with open(m.path, "r", encoding="utf-8", errors="replace") as f:
                     for i, line in enumerate(f):
