@@ -40,7 +40,7 @@ uv run adm --transplant opencode-export.json --to codex --cwd D:\hello --title "
 
 | 功能 | 说明 |
 |---|---|
-| 统一会话列表 | Claude、Codex、OpenCode、Junie、Pi、Gemini、Qwen、Goose、Cline、Roo、Qoder 汇成一个列表;列:收藏/来源/标题/项目/消息数/大小/tokens/时间/状态。Claude/Codex 可编辑,其它来源只读 |
+| 统一会话列表 | Claude、Codex、OpenCode、Junie、Pi、Gemini、Qwen、Goose、Cline、Roo、Qoder 汇成一个列表;列:收藏/来源/标题/项目/消息数/大小/tokens/时间/状态。Claude/Codex/OpenCode 可编辑,其它来源只读 |
 | **增量扫描缓存** | 首次扫描建立 `%APPDATA%\ai-dialog-manager\scan_cache.json`;之后启动只 stat 变更文件,821 个会话约 0.7 秒(实测)。缓存损坏会自动忽略并重扫 |
 | **中英双语** | 工具栏右侧 🌐 下拉切换 中文 / English,即时生效全界面(含菜单、对话框、表头),选择自动记住(下次启动沿用) |
 | 筛选 | 关键词、来源、项目下拉、只看收藏、隐藏归档、隐藏子代理 |
@@ -66,7 +66,7 @@ uv run adm --transplant opencode-export.json --to codex --cwd D:\hello --title "
 |---|---|---|---|
 | Claude Code | `~/.claude/projects/**/*.jsonl` | ✅ | `claude --resume <id>` |
 | Codex | `~/.codex/state_*.sqlite` + `sessions/**/rollout-*.jsonl` | ✅ | `codex resume <id>` |
-| OpenCode | `~/.local/share/opencode/opencode.db`(`session_v2` / `session_message`) | 只读 | `opencode --session <id>` |
+| OpenCode | `~/.local/share/opencode/opencode.db`(`session_v2` / `session_message`) | ✅ | `opencode --session <id>` |
 | Junie | `~/.junie/sessions/<id>/transcript.md` + `summary.json` | 只读 | `junie --session-id <id> --resume` |
 | Pi | `~/.pi/agent/sessions/<project>/*.jsonl` | 只读 | `pi --session <id>` |
 | Gemini CLI | `~/.gemini/tmp/<项目哈希>/chats/session-*.json` | 只读 | `gemini --resume <id>` |
@@ -76,7 +76,8 @@ uv run adm --transplant opencode-export.json --to codex --cwd D:\hello --title "
 | Roo Code | VS Code `globalStorage/rooveterinaryinc.roo-cline/tasks/<id>/` | 只读 | 在 VS Code Roo 历史中打开 |
 | Qoder | `%APPDATA%\com.qodercn.app.stable\main.sqlite`(`chat_sessions` / `chat_session_messages`) | 只读 | 在 Qoder 中打开 |
 
-- 只读来源支持:列表、来源/项目筛选、关键词、全局搜索、收藏/备注、自定义标题、导出 Markdown、统计、按项目分组、跨工具转生;不支持编辑/删除消息、复制会话、归档或导出「可恢复上传包」,以免误改原应用数据库。
+- Claude/Codex/OpenCode 之外的只读来源支持:列表、来源/项目筛选、关键词、全局搜索、收藏/备注、自定义标题、导出 Markdown、统计、按项目分组、跨工具转生;不支持编辑/删除消息、复制会话、归档或导出「可恢复上传包」,以免误改原应用数据库。
+- OpenCode 的编辑直接写 `opencode.db`(`session_message.data`),改动前自动把该会话的全部记录快照到 `%APPDATA%\ai-dialog-manager\backups\opencode\<id>\`;删除消息后会重排 `seq`,追加用户消息会顺延 `seq` 并刷新 `session_v2.time_updated`。
 - 来源筛选只显示本机实际存在的来源,不会堆一排空选项。
 - 测试/便携环境可用环境变量覆盖位置:`OPENCODE_DATA_DIR`、`JUNIE_HOME`、`PI_AGENT_HOME`、`GEMINI_CLI_HOME`、`QWEN_HOME`、`GOOSE_HOME`、`ADM_VSCODE_GLOBAL_STORAGE`、`QODER_HOME`。
 

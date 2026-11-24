@@ -1,7 +1,9 @@
-"""Read-only OpenCode (2.x) session store.
+"""OpenCode (2.x) session store.
 
 OpenCode keeps sessions in ``opencode.db`` (SQLite).  The desktop/web UI is
-backed by the same database, so this works without a running service.
+backed by the same database, so this works without a running service.  Edits
+rewrite ``session_message.data`` (JSON) in place after snapshotting the whole
+database into the app backup folder.
 """
 from __future__ import annotations
 
@@ -9,10 +11,11 @@ import json
 import os
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
-from . import util
+from . import config, util
 from .models import LoadedSession, Message, Part, SessionMeta
 
 
@@ -38,6 +41,21 @@ def _connect(path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(uri, uri=True, timeout=4)
     con.row_factory = sqlite3.Row
     return con
+
+
+def _connect_rw(path: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(str(path), timeout=10)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA busy_timeout=10000")
+    return con
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _new_id(prefix: str) -> str:
+    return prefix + uuid.uuid4().hex[:26]
 
 
 def _ms(value) -> int:
@@ -177,32 +195,36 @@ def load_session(meta: SessionMeta) -> LoadedSession:
             data = json.loads(r["data"] or "{}")
         except (TypeError, ValueError):
             continue
+        if not isinstance(data, dict):
+            continue
         role = "user" if r["type"] == "user" else "assistant"
         parts: list[Part] = []
         if role == "user":
             text = data.get("text")
             if isinstance(text, str) and text:
-                parts.append(Part(kind="text", text=text))
+                parts.append(Part(kind="text", text=text, raw=data))
             content = data.get("content")
             if isinstance(content, list):
                 for b in content:
                     if isinstance(b, dict) and isinstance(b.get("text"), str):
-                        parts.append(Part(kind="text", text=b["text"]))
+                        parts.append(Part(kind="text", text=b["text"], raw=b))
         else:
             content = data.get("content")
             if isinstance(content, str):
                 if content:
-                    parts.append(Part(kind="text", text=content))
+                    parts.append(Part(kind="text", text=content, raw=data))
                 content = []
             for block in content or []:
                 if not isinstance(block, dict):
                     continue
                 typ = block.get("type")
                 if typ == "text":
-                    parts.append(Part(kind="text", text=block.get("text") or ""))
+                    parts.append(Part(kind="text", text=block.get("text") or "",
+                                      raw=block))
                 elif typ in ("reasoning", "thinking"):
                     parts.append(Part(kind="thinking",
-                                      text=block.get("text") or block.get("thinking") or ""))
+                                      text=block.get("text") or block.get("thinking") or "",
+                                      raw=block))
                 elif typ == "tool":
                     state = block.get("state") or {}
                     if not isinstance(state, dict):
@@ -230,6 +252,325 @@ def load_session(meta: SessionMeta) -> LoadedSession:
                                  or r["time_created"]))
         messages.append(Message(
             line=i, role=role, ts=ts, parts=parts,
-            model=_model_name(data.get("model"))))
+            model=_model_name(data.get("model")),
+            opencode_id=str(r["id"]),
+            opencode_record=data))
     return LoadedSession(meta=meta, messages=messages, raw_lines=[],
                          total_lines=len(messages))
+
+
+# ---------------------------------------------------------------- edits
+
+def _backup(meta: SessionMeta) -> None:
+    """Snapshot the session's rows (session + messages) before a mutation.
+
+    The database itself is shared by every OpenCode session and can be
+    hundreds of MB, so only the affected rows are stored as JSON."""
+    src = Path(meta.path)
+    d = config.BACKUP_DIR / "opencode" / meta.id
+    d.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+    con = _connect(src)
+    try:
+        session = con.execute("SELECT * FROM session_v2 WHERE id=?",
+                              (meta.id,)).fetchone()
+        messages = con.execute(
+            "SELECT * FROM session_message WHERE session_id=? ORDER BY seq",
+            (meta.id,)).fetchall()
+    finally:
+        con.close()
+    payload = {
+        "source": "opencode",
+        "id": meta.id,
+        "path": str(src),
+        "taken_at": stamp,
+        "session": dict(session) if session else None,
+        "messages": [dict(r) for r in messages],
+    }
+    (d / f"{stamp}.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    try:
+        backups = sorted(d.glob("*.json")) + sorted(d.glob("*.db"))
+        for old in backups[:max(0, len(backups) - config.BACKUPS_KEEP)]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _read_data(meta: SessionMeta, msg: Message) -> dict:
+    if not msg.opencode_id:
+        raise ValueError("OpenCode message id is missing")
+    con = _connect(Path(meta.path))
+    try:
+        row = con.execute(
+            "SELECT data FROM session_message WHERE id=? AND session_id=?",
+            (msg.opencode_id, meta.id)).fetchone()
+    finally:
+        con.close()
+    if not row:
+        raise ValueError("OpenCode message no longer exists")
+    try:
+        data = json.loads(row["data"] or "{}")
+    except (TypeError, ValueError) as e:
+        raise ValueError("OpenCode message data is not valid JSON") from e
+    if not isinstance(data, dict):
+        raise ValueError("OpenCode message data is not an object")
+    return data
+
+
+def _write_data(meta: SessionMeta, msg: Message, data: dict) -> None:
+    if not msg.opencode_id:
+        raise ValueError("OpenCode message id is missing")
+    now = _now_ms()
+    raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    con = _connect_rw(Path(meta.path))
+    try:
+        cur = con.execute(
+            "UPDATE session_message SET data=?, time_updated=? "
+            "WHERE id=? AND session_id=?",
+            (raw, now, msg.opencode_id, meta.id))
+        if cur.rowcount == 0:
+            raise ValueError("OpenCode message no longer exists")
+        con.execute("UPDATE session_v2 SET time_updated=? WHERE id=?",
+                    (now, meta.id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _targets(data: dict, role: str) -> list[tuple[str, dict | None]]:
+    """Editable targets in exactly the same order as load_session() parts."""
+    out: list[tuple[str, dict | None]] = []
+    if role == "user":
+        text = data.get("text")
+        if isinstance(text, str) and text:
+            out.append(("user_text", None))
+        content = data.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    out.append(("block_text", block))
+        return out
+    content = data.get("content")
+    if isinstance(content, str):
+        if content:
+            out.append(("content_string", None))
+        return out
+    for block in content or []:
+        if not isinstance(block, dict):
+            continue
+        typ = block.get("type")
+        if typ == "text":
+            out.append(("block_text", block))
+        elif typ in ("reasoning", "thinking"):
+            out.append(("block_thinking", block))
+        elif typ == "tool":
+            out.append(("tool_input", block))
+            state = block.get("state") or {}
+            if isinstance(state, dict) and _tool_output(state):
+                out.append(("tool_output", block))
+        elif typ in ("file", "patch"):
+            out.append(("block_text", block))
+    return out
+
+
+def _apply_text(data: dict, role: str, new_texts: dict[int, str]) -> None:
+    targets = _targets(data, role)
+    for index, text in new_texts.items():
+        if not isinstance(index, int) or index < 0 or index >= len(targets):
+            continue
+        kind, block = targets[index]
+        if kind == "user_text":
+            data["text"] = text
+        elif kind == "content_string":
+            data["content"] = text
+        elif kind == "block_text":
+            assert block is not None
+            block["text"] = text
+        elif kind == "block_thinking":
+            assert block is not None
+            block["text"] = text
+        elif kind == "tool_input":
+            assert block is not None
+            try:
+                parsed = json.loads(text)
+            except ValueError as e:
+                raise ValueError("tool arguments must be valid JSON") from e
+            state = block.get("state")
+            if not isinstance(state, dict):
+                state = {}
+                block["state"] = state
+            state["input"] = parsed
+        elif kind == "tool_output":
+            assert block is not None
+            state = block.get("state")
+            if not isinstance(state, dict):
+                state = {}
+                block["state"] = state
+            if "error" in state and "output" not in state:
+                state["error"] = text
+            else:
+                state["output"] = text
+
+
+def apply_text_edits(meta: SessionMeta, msg: Message,
+                     new_texts: dict[int, str]) -> None:
+    """Save edited text/thinking/tool parts for one OpenCode message."""
+    if not new_texts:
+        return
+    _backup(meta)
+    data = _read_data(meta, msg)
+    _apply_text(data, msg.role, new_texts)
+    _write_data(meta, msg, data)
+
+
+def apply_raw_edit(meta: SessionMeta, msg: Message, raw_json: str) -> None:
+    try:
+        data = json.loads(raw_json)
+    except ValueError as e:
+        raise ValueError("invalid JSON") from e
+    if not isinstance(data, dict):
+        raise ValueError("message data must be a JSON object")
+    _backup(meta)
+    _write_data(meta, msg, data)
+
+
+def delete_messages(meta: SessionMeta, msgs: list[Message]) -> int:
+    """Delete whole OpenCode message rows and compact their seq numbers."""
+    ids = [m.opencode_id for m in msgs if m.opencode_id]
+    if not ids:
+        return 0
+    _backup(meta)
+    con = _connect_rw(Path(meta.path))
+    try:
+        marks = ",".join("?" for _ in ids)
+        cur = con.execute(
+            f"DELETE FROM session_message WHERE session_id=? AND id IN ({marks})",
+            (meta.id, *ids))
+        deleted = cur.rowcount
+        rows = con.execute(
+            "SELECT id FROM session_message WHERE session_id=? ORDER BY seq",
+            (meta.id,)).fetchall()
+        for seq, row in enumerate(rows, 1):
+            con.execute("UPDATE session_message SET seq=? WHERE id=?",
+                        (seq, row["id"]))
+        con.execute("UPDATE session_v2 SET time_updated=? WHERE id=?",
+                    (_now_ms(), meta.id))
+        con.commit()
+        return deleted
+    finally:
+        con.close()
+
+
+def append_user_message(meta: SessionMeta, text: str) -> str:
+    """Append a human user message so the OpenCode session can be resumed."""
+    _backup(meta)
+    now = _now_ms()
+    msg_id = _new_id("msg_")
+    data = {"time": {"created": now}, "text": text,
+            "files": [], "agents": []}
+    raw = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    con = _connect_rw(Path(meta.path))
+    try:
+        row = con.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS seq "
+            "FROM session_message WHERE session_id=?", (meta.id,)).fetchone()
+        seq = int(row["seq"] if row else 1)
+        con.execute(
+            "INSERT INTO session_message "
+            "(id, session_id, type, seq, time_created, time_updated, data) "
+            "VALUES (?, ?, 'user', ?, ?, ?, ?)",
+            (msg_id, meta.id, seq, now, now, raw))
+        con.execute("UPDATE session_v2 SET time_updated=? WHERE id=?",
+                    (now, meta.id))
+        con.commit()
+        return msg_id
+    finally:
+        con.close()
+
+
+def set_archived(meta: SessionMeta, archived: bool) -> None:
+    now = _now_ms()
+    con = _connect_rw(Path(meta.path))
+    try:
+        con.execute("UPDATE session_v2 SET time_archived=?, time_updated=? "
+                    "WHERE id=?",
+                    (now if archived else None, now, meta.id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def rename_session(meta: SessionMeta, title: str) -> None:
+    con = _connect_rw(Path(meta.path))
+    try:
+        cur = con.execute("UPDATE session_v2 SET title=?, time_updated=? "
+                          "WHERE id=?", (title, _now_ms(), meta.id))
+        if cur.rowcount == 0:
+            raise ValueError("OpenCode session no longer exists")
+        con.commit()
+    finally:
+        con.close()
+
+
+def delete_session(meta: SessionMeta) -> None:
+    """Delete one session row; messages go with it (ON DELETE CASCADE)."""
+    _backup(meta)
+    con = _connect_rw(Path(meta.path))
+    try:
+        con.execute("DELETE FROM session_message WHERE session_id=?", (meta.id,))
+        con.execute("DELETE FROM session_v2 WHERE id=?", (meta.id,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def duplicate_session(meta: SessionMeta) -> str:
+    """Copy an OpenCode session (metadata + messages) under a fresh id."""
+    _backup(meta)
+    new_id = _new_id("ses_")
+    now = _now_ms()
+    con = _connect_rw(Path(meta.path))
+    try:
+        row = con.execute("SELECT * FROM session_v2 WHERE id=?",
+                          (meta.id,)).fetchone()
+        if not row:
+            raise ValueError("OpenCode session no longer exists")
+        data = dict(row)
+        data.update({
+            "id": new_id,
+            "title": (str(data.get("title") or "Copy")) + " (copy)",
+            "slug": str(data.get("slug") or "copy") + "-copy",
+            "parent_id": None,
+            "fork_session_id": meta.id,
+            "share_url": None,
+            "revert": None,
+            "time_archived": None,
+            "time_busy": None,
+            "time_idle": None,
+            "time_created": now,
+            "time_updated": now,
+        })
+        cols = list(data)
+        con.execute(
+            f"INSERT INTO session_v2 ({','.join(cols)}) "
+            f"VALUES ({','.join('?' for _ in cols)})",
+            [data[c] for c in cols])
+        messages = con.execute(
+            "SELECT * FROM session_message WHERE session_id=? ORDER BY seq",
+            (meta.id,)).fetchall()
+        for msg in messages:
+            mdata = dict(msg)
+            mdata["id"] = _new_id("msg_")
+            mdata["session_id"] = new_id
+            mdata["time_created"] = now
+            mdata["time_updated"] = now
+            mcols = list(mdata)
+            con.execute(
+                f"INSERT INTO session_message ({','.join(mcols)}) "
+                f"VALUES ({','.join('?' for _ in mcols)})",
+                [mdata[c] for c in mcols])
+        con.commit()
+        return new_id
+    finally:
+        con.close()

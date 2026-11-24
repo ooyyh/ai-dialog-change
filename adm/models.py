@@ -28,6 +28,8 @@ class Message:
     sidechain: bool = False     # claude subagent traffic
     codex_payload: dict | None = None  # original payload for codex records
     claude_record: dict | None = None  # original record for claude records
+    opencode_id: str = ""              # session_message.id for OpenCode rows
+    opencode_record: dict | None = None  # parsed OpenCode message data
 
     @property
     def is_tool_related(self) -> bool:

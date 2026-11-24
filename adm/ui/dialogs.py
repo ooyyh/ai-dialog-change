@@ -68,8 +68,35 @@ class MessageEditDialog(QDialog):
         # --- text tab
         text_page = QWidget()
         tlay = QVBoxLayout(text_page)
-        self.text_edits: list[tuple[str, QPlainTextEdit]] = []
-        if msg.codex_payload is not None:
+        self.text_edits: list[tuple[object, QPlainTextEdit]] = []
+        if msg.opencode_record is not None:
+            for i, part in enumerate(msg.parts):
+                if part.kind == "text":
+                    tlay.addWidget(QLabel(tr("part_n", i=i, t=part.kind)))
+                    te = QPlainTextEdit(part.text or "")
+                    te.setMinimumHeight(160)
+                    tlay.addWidget(te)
+                    self.text_edits.append((i, te))
+                elif part.kind in ("thinking", "reasoning"):
+                    tlay.addWidget(QLabel(tr("part_n", i=i, t=part.kind)))
+                    te = QPlainTextEdit(part.text or "")
+                    tlay.addWidget(te)
+                    self.text_edits.append((i, te))
+                elif part.kind == "tool_call":
+                    tlay.addWidget(QLabel(tr("part_n", i=i,
+                                            t="tool input (JSON)")))
+                    te = _mono_te()
+                    te.setPlainText(part.text or "{}")
+                    tlay.addWidget(te)
+                    self.text_edits.append((i, te))
+                elif part.kind == "tool_result":
+                    tlay.addWidget(QLabel(tr("part_n", i=i,
+                                            t="tool output")))
+                    te = _mono_te()
+                    te.setPlainText(part.text or "")
+                    tlay.addWidget(te)
+                    self.text_edits.append((i, te))
+        elif msg.codex_payload is not None:
             p = msg.codex_payload
             if p.get("type") == "message":
                 for i, part in enumerate(p.get("content") or []):
@@ -142,9 +169,12 @@ class MessageEditDialog(QDialog):
         raw_page = QWidget()
         rlay = QVBoxLayout(raw_page)
         self.raw_edit = _mono_te()
-        src = msg.codex_payload if msg.codex_payload is not None else msg.claude_record
-        if msg.codex_payload is not None:
-            src = json.loads(json.dumps(src))
+        if msg.opencode_record is not None:
+            src = json.loads(json.dumps(msg.opencode_record))
+        elif msg.codex_payload is not None:
+            src = json.loads(json.dumps(msg.codex_payload))
+        else:
+            src = msg.claude_record
         self.raw_edit.setPlainText(json.dumps(src, ensure_ascii=False, indent=2))
         self.raw_edit.setMinimumHeight(300)
         rlay.addWidget(self.raw_edit)
@@ -176,6 +206,9 @@ class MessageEditDialog(QDialog):
     def new_texts(self) -> dict[int, str]:
         """{part index within msg.parts -> new text} for store.apply_text_edits."""
         out: dict[int, str] = {}
+        # OpenCode edits are keyed by Message.parts index, matching the store.
+        if self.msg.opencode_record is not None:
+            return {int(k): te.toPlainText() for k, te in self.text_edits}
         # build mapping mirroring the dialog construction order
         if self.msg.codex_payload is not None:
             return {i: te.toPlainText() for i, (_, te) in enumerate(self.text_edits)}

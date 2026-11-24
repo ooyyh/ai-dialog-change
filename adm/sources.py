@@ -1,6 +1,6 @@
 """Registry of session sources supported by the app.
 
-Claude and Codex remain fully editable.  The other sources are scraped
+Claude, Codex and OpenCode are editable.  The remaining sources are scraped
 read-only: they are displayed, searched, starred, exported and converted, but
 the app never rewrites their native stores.
 """
@@ -23,7 +23,7 @@ class SourceInfo:
 SOURCES: dict[str, SourceInfo] = {
     "claude": SourceInfo("claude", "Claude", "#5b8cff", True, 10),
     "codex": SourceInfo("codex", "Codex", "#4ec9a8", True, 20),
-    "opencode": SourceInfo("opencode", "OpenCode", "#f2a33b", False, 30),
+    "opencode": SourceInfo("opencode", "OpenCode", "#f2a33b", True, 30),
     "junie": SourceInfo("junie", "Junie", "#59c26d", False, 40),
     "pi": SourceInfo("pi", "Pi", "#c586ff", False, 50),
     "gemini": SourceInfo("gemini", "Gemini", "#8a7dff", False, 60),

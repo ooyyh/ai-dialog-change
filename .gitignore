@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# PyInstaller scratch (the shipped exe itself lives in dist/)
+build/
+*.spec
+dist/*.pkg

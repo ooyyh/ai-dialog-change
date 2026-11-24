@@ -508,13 +508,67 @@ def selftest() -> int:
         print(f"   granular transcript: {len(sess.messages)} source msgs -> "
               f"{len(neutral)} neutral, max {biggest} chars: OK")
     from adm.models import SessionMeta as _SM
-    assert not sources.is_editable("opencode")
+    assert sources.is_editable("opencode")
     assert sources.resume_command(
         _SM(source="opencode", id="ses_x", path="", project="")) == \
         "opencode --session ses_x"
     assert sources.resume_command(
         _SM(source="qoder", id="q", path="", project="")) is None
-    print("   source registry / read-only flag: OK")
+    print("   source registry / editable flag: OK")
+
+    if oc_metas:
+        import sqlite3
+        with tempfile.TemporaryDirectory() as td:
+            # copy only the schema + one session (the real db can be ~1 GB)
+            src = Path(oc_metas[0].path)
+            db = Path(td) / "opencode.db"
+            s = sqlite3.connect(str(src))
+            d = sqlite3.connect(str(db))
+            try:
+                for name in ("session_v2", "session_message"):
+                    ddl = s.execute("SELECT sql FROM sqlite_master "
+                                    "WHERE name=?", (name,)).fetchone()
+                    assert ddl and ddl[0], f"missing table {name}"
+                    d.execute(ddl[0])
+                row = s.execute("SELECT * FROM session_v2 WHERE id=?",
+                                (oc_metas[0].id,)).fetchone()
+                assert row, "OpenCode session row missing"
+                d.execute(f"INSERT INTO session_v2 VALUES "
+                          f"({','.join('?' for _ in row)})", row)
+                msgs = s.execute("SELECT * FROM session_message "
+                                 "WHERE session_id=? ORDER BY seq",
+                                 (oc_metas[0].id,)).fetchall()
+                for mrow in msgs:
+                    d.execute(f"INSERT INTO session_message VALUES "
+                              f"({','.join('?' for _ in mrow)})", mrow)
+                d.commit()
+            finally:
+                d.close()
+                s.close()
+            meta = _SM(source="opencode", id=oc_metas[0].id, path=str(db),
+                       project=oc_metas[0].project, title=oc_metas[0].title)
+            sess = opencode_store.load_session(meta)
+            msg = next((x for x in sess.messages if x.role == "user"
+                        and any(p.kind == "text" for p in x.parts)), None)
+            assert msg is not None, "OpenCode edit test found no user message"
+            idx = next(i for i, p in enumerate(msg.parts) if p.kind == "text")
+            opencode_store.apply_text_edits(meta, msg,
+                                            {idx: "[adm selftest edit]"})
+            sess = opencode_store.load_session(meta)
+            assert any(p.kind == "text" and p.text == "[adm selftest edit]"
+                       for x in sess.messages for p in x.parts), \
+                "OpenCode text edit did not persist"
+            new_id = opencode_store.append_user_message(meta,
+                                                        "[adm selftest add]")
+            sess = opencode_store.load_session(meta)
+            added = next((x for x in sess.messages
+                          if x.opencode_id == new_id), None)
+            assert added is not None, "OpenCode append did not persist"
+            opencode_store.delete_messages(meta, [added])
+            sess = opencode_store.load_session(meta)
+            assert not any(x.opencode_id == new_id for x in sess.messages), \
+                "OpenCode delete did not persist"
+        print("   OpenCode edit/append/delete round-trip: OK")
 
     _cfg.BACKUP_DIR = orig_backup
     print("SELFTEST", "PASS" if ok else "FAIL")

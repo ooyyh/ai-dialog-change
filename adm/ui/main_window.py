@@ -16,8 +16,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .. import (claude_store, codex_store, launcher, local_store, sources,
-                transfer, transplant, util)
+from .. import (claude_store, codex_store, launcher, local_store,
+                opencode_store, sources, transfer, transplant, util)
 from ..i18n import role_label, set_lang, tr
 from ..jsonlio import FileChangedError
 from ..models import LoadedSession, Message, SessionMeta
@@ -780,6 +780,8 @@ class MainWindow(QMainWindow):
                 ed.note_snapshot("claude", m.id)
                 claude_store.append_title(ed, m.id, title)
                 ed.save()
+            elif m.source == "opencode":
+                opencode_store.rename_session(m, title)
             else:
                 codex_store.rename_thread(m.id, title)
         except FileChangedError:
@@ -800,6 +802,16 @@ class MainWindow(QMainWindow):
     def toggle_archive(self) -> None:
         m = self._selected() or (self.loaded.meta if self.loaded else None)
         if not m:
+            return
+        if m.source == "opencode":
+            try:
+                opencode_store.set_archived(m, not m.archived)
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.critical(self, tr("del_failed"), str(e))
+                return
+            m.archived = not m.archived
+            self.model.update_row(m)
+            self._apply_filters()
             return
         if m.source != "codex":
             if not m.editable:
@@ -827,6 +839,8 @@ class MainWindow(QMainWindow):
         try:
             if m.source == "claude":
                 new_id = _duplicate_claude(m)
+            elif m.source == "opencode":
+                new_id = opencode_store.duplicate_session(m)
             else:
                 new_id = codex_store.duplicate_session(m)
         except Exception as e:  # noqa: BLE001
@@ -954,7 +968,7 @@ class MainWindow(QMainWindow):
         if not metas:
             QMessageBox.information(self, tr("app_title"), tr("b_none"))
             return
-        cx = [m for m in metas if m.source == "codex"]
+        cx = [m for m in metas if m.source in ("codex", "opencode")]
         skipped = len(metas) - len(cx)
         if not cx:
             QMessageBox.information(self, tr("arch_claude_title"),
@@ -964,7 +978,10 @@ class MainWindow(QMainWindow):
         err = 0
         for m in cx:
             try:
-                codex_store.set_archived(m.id, target)
+                if m.source == "opencode":
+                    opencode_store.set_archived(m, target)
+                else:
+                    codex_store.set_archived(m.id, target)
                 m.archived = target
                 self.model.update_row(m)
             except Exception:  # noqa: BLE001
@@ -1042,6 +1059,10 @@ class MainWindow(QMainWindow):
         if not m.editable:
             return False
         try:
+            if m.source == "opencode":
+                # one shared database: delete the rows, never the file
+                opencode_store.delete_session(m)
+                return True
             make_backup(m.path, m.source, m.id)
             Path(m.path).unlink(missing_ok=True)
             if m.source == "codex":
@@ -1070,7 +1091,12 @@ class MainWindow(QMainWindow):
         if dlg.exec() != MessageEditDialog.DialogCode.Accepted:
             return
         try:
-            if m.source == "claude":
+            if m.source == "opencode":
+                if dlg.use_raw:
+                    opencode_store.apply_raw_edit(m, msg, dlg.raw_json())
+                else:
+                    opencode_store.apply_text_edits(m, msg, dlg.new_texts())
+            elif m.source == "claude":
                 ed = claude_store.make_editor(self.loaded)
                 if dlg.use_raw:
                     claude_store.apply_raw_edit(ed, msg, dlg.raw_json())
@@ -1108,10 +1134,13 @@ class MainWindow(QMainWindow):
         if not m.editable:
             self._readonly(m)
             return
-        store = claude_store if m.source == "claude" else codex_store
-        linked: set[int] = set()
-        for msg in msgs:
-            linked |= store.linked_lines(self.loaded, msg)
+        if m.source == "opencode":
+            linked = {msg.line for msg in msgs}
+        else:
+            store = claude_store if m.source == "claude" else codex_store
+            linked: set[int] = set()
+            for msg in msgs:
+                linked |= store.linked_lines(self.loaded, msg)
         if not linked:
             return
         removed = [x for x in self.loaded.messages if x.line in linked]
@@ -1135,15 +1164,18 @@ class MainWindow(QMainWindow):
         if not _confirm(self, tr("delmsg_title"), body):
             return
         try:
-            ed = store.make_editor(self.loaded)
-            ed.delete_lines(linked)
-            if m.source == "claude":
-                # re-link parentUuid chain + last-prompt.leafUuid, otherwise
-                # the CLI can't rebuild the tree and won't render the session
-                claude_store.repair_after_delete(ed, linked)
-            ed.save()
-            if m.source == "codex":
-                codex_store.invalidate_history(m.id)
+            if m.source == "opencode":
+                opencode_store.delete_messages(m, msgs)
+            else:
+                ed = store.make_editor(self.loaded)
+                ed.delete_lines(linked)
+                if m.source == "claude":
+                    # re-link parentUuid chain + last-prompt.leafUuid, otherwise
+                    # the CLI can't rebuild the tree and won't render the session
+                    claude_store.repair_after_delete(ed, linked)
+                ed.save()
+                if m.source == "codex":
+                    codex_store.invalidate_history(m.id)
         except FileChangedError:
             QMessageBox.warning(self, tr("changed_disk_title"),
                                 tr("changed_disk_short"))
@@ -1170,15 +1202,18 @@ class MainWindow(QMainWindow):
         if dlg.exec() != AddMessageDialog.DialogCode.Accepted or not dlg.text():
             return
         try:
-            ed = claude_store.make_editor(self.loaded) if m.source == "claude" \
-                else codex_store.make_editor(self.loaded)
-            if m.source == "claude":
-                claude_store.append_user_message(ed, m.id, m.cwd, dlg.text())
+            if m.source == "opencode":
+                opencode_store.append_user_message(m, dlg.text())
             else:
-                codex_store.append_user_message(ed, dlg.text())
-            ed.save()
-            if m.source == "codex":
-                codex_store.invalidate_history(m.id)
+                ed = claude_store.make_editor(self.loaded) if m.source == "claude" \
+                    else codex_store.make_editor(self.loaded)
+                if m.source == "claude":
+                    claude_store.append_user_message(ed, m.id, m.cwd, dlg.text())
+                else:
+                    codex_store.append_user_message(ed, dlg.text())
+                ed.save()
+                if m.source == "codex":
+                    codex_store.invalidate_history(m.id)
         except FileChangedError:
             QMessageBox.warning(self, tr("changed_disk_title"),
                                 tr("changed_disk_short"))
